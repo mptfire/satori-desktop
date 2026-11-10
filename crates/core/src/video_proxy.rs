@@ -99,7 +99,10 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 pub fn spawn(origin: String) -> Result<RangeProxy, std::io::Error> {
     let (tx, rx) = std::sync::mpsc::channel();
     let token = new_token();
-    let state = Arc::new(State { origin, token: token.clone() });
+    let state = Arc::new(State {
+        origin,
+        token: token.clone(),
+    });
     let task = runtime().spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(l) => l,
@@ -185,7 +188,8 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<State>) {
         .lines()
         .find_map(|l| {
             let (k, v) = l.split_once(':')?;
-            k.eq_ignore_ascii_case("range").then(|| v.trim().to_string())
+            k.eq_ignore_ascii_case("range")
+                .then(|| v.trim().to_string())
         })
         .filter(|v| !v.is_empty());
 
@@ -216,7 +220,10 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<State>) {
         status,
         reason(status),
         [
-            ("Accept-Ranges", Some(header(&res, "accept-ranges").unwrap_or_else(|| "bytes".into()))),
+            (
+                "Accept-Ranges",
+                Some(header(&res, "accept-ranges").unwrap_or_else(|| "bytes".into()))
+            ),
             ("Content-Length", header(&res, "content-length")),
             ("Content-Range", header(&res, "content-range")),
             ("Content-Type", header(&res, "content-type")),
@@ -274,10 +281,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-async fn simple(
-    wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    status: u16,
-) -> std::io::Result<()> {
+async fn simple(wr: &mut tokio::net::tcp::OwnedWriteHalf, status: u16) -> std::io::Result<()> {
     wr.write_all(
         format!(
             "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -313,8 +317,7 @@ mod tests {
 
     #[test]
     fn capability_gate_refuses_wrong_token() {
-        let proxy = spawn("https://blossom.example.invalid/x.mp4".into())
-            .expect("loopback bind");
+        let proxy = spawn("https://blossom.example.invalid/x.mp4".into()).expect("loopback bind");
         let uri = proxy.uri();
         assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
         assert!(uri.ends_with("/stream"));

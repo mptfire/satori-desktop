@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use nostr::prelude::*;
 

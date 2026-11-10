@@ -122,13 +122,14 @@ async fn serve_conn(stream: tokio::net::TcpStream) {
             return;
         }
     };
-    let outbound = match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(dial)).await {
-        Ok(Ok(s)) => s,
-        _ => {
-            let _ = wr.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
-            return;
-        }
-    };
+    let outbound =
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(dial)).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                let _ = wr.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                return;
+            }
+        };
     // Success: BND.ADDR/PORT are advisory — zeros are fine.
     if wr.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {
         return;
@@ -149,10 +150,7 @@ pub(crate) enum Target {
     Domain(String, u16),
 }
 
-async fn read_target(
-    rd: &mut tokio::net::tcp::OwnedReadHalf,
-    atyp: u8,
-) -> Option<Target> {
+async fn read_target(rd: &mut tokio::net::tcp::OwnedReadHalf, atyp: u8) -> Option<Target> {
     match atyp {
         1 => {
             let mut o = [0u8; 4];
@@ -259,7 +257,9 @@ mod tests {
         c.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [5, 0], "no-auth accepted");
         // CONNECT 127.0.0.1:9 (discard port, loopback).
-        c.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 9]).await.unwrap();
+        c.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 9])
+            .await
+            .unwrap();
         let mut verdict = [0u8; 10];
         c.read_exact(&mut verdict).await.unwrap();
         assert_eq!(verdict[1], 2, "ruleset refusal, got {}", verdict[1]);
