@@ -67,13 +67,22 @@ pub fn opening(url: &str) -> bool {
 }
 
 /// Can this video play inline (Phase 3 §5)? Video by extension or imeta
-/// mime, never a YouTube watch/shorts page (GStreamer can't stream those —
-/// they stay browser links), never under strict Tor (the facade rule).
+/// mime, https-only (the player dials the URL itself — playbin with its
+/// own redirects — and every guarded fetch path in the app is https;
+/// a cleartext video degrades to the browser link, where the user's own
+/// client stack makes the fetch), never a YouTube watch/shorts page
+/// (GStreamer can't stream those — they stay browser links), never under
+/// strict Tor (the facade rule).
 pub fn inline_able(url: &str, mime: Option<&str>) -> bool {
     if crate::prefs::privacy_mode() == satori_core::privacy::PrivacyMode::Strict {
         return false;
     }
     if content::youtube_thumb(url).is_some() {
+        return false;
+    }
+    // Cleartext stays out of the player: web_url() admits http:// for the
+    // browser handoff, but the inline pipeline is a GET we dial ourselves.
+    if !url.starts_with("https://") {
         return false;
     }
     mime.is_some_and(|m| m.starts_with("video/")) || content::is_video_url(url)
