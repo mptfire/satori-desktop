@@ -27,6 +27,7 @@ use nostr_sdk::authenticator::Authenticator;
 use nostr_sdk::client::ReqTarget;
 use nostr_sdk::error::Error as SdkError;
 use nostr_sdk::prelude::*;
+use nostr_sdk::proxy::Proxy;
 use nostr_sdk::relay::EventSendStatus;
 
 use crate::deletions;
@@ -223,6 +224,10 @@ impl Authenticator for PoolAuthenticator {
 
 pub struct Pool {
     client: Client,
+    /// The screening transport every non-user relay dials through
+    /// (socks.rs). Held for the pool's lifetime; dropping it stops the
+    /// listener. None only in tests that never connect.
+    screening: Option<crate::socks::ScreeningSocks>,
     pub store: Store,
     identity: PoolIdentity,
     /// Relays added for ROUTED reads (url -> last routed use), evicted when
@@ -247,6 +252,14 @@ impl Pool {
     }
 
     pub async fn open() -> Result<Self, SdkError> {
+        // M5 WP2: the screening transport. Every relay NOT in the
+        // user-chosen set dials through it — resolution pinned
+        // fail-closed to public unicast. If loopback won't bind there
+        // is NO unpinned fallback: the pool refuses to exist.
+        let screening = crate::socks::spawn()
+            .await
+            .map_err(|e| SdkError::other(format!("screening transport: {e}")))?;
+        let socks_addr = screening.addr();
         let store = Store::open().await?;
         // No keys live in the client: NIP-42 AUTH challenges are answered
         // with the session identity (set_identity, below) — the owner's
@@ -257,7 +270,25 @@ impl Pool {
         let client = ClientBuilder::new()
             .database(store.database())
             .authenticator(PoolAuthenticator(identity.clone()))
+            .proxy(Proxy::custom(move |url| {
+                // User-entered relays dial direct (the exemption is BY
+                // NAME and remote data can never join it — net_guard);
+                // everything else rides the screening transport.
+                if crate::net_guard::user_chosen_relay(url.as_str()) {
+                    None
+                } else {
+                    Some(socks_addr)
+                }
+            }))
             .build();
+        // The house indexers are constants the app chose — same trust
+        // class as user entries; they dial direct, as they always have.
+        for indexer in INDEXERS {
+            if let Ok(parsed) = url::Url::parse(indexer)
+                && let Some(host) = parsed.host_str() {
+                    crate::net_guard::allow_direct_relay(host);
+            }
+        }
         Ok(Self {
             client,
             store,
@@ -265,6 +296,7 @@ impl Pool {
             routed: Mutex::new(HashMap::new()),
             reads: Mutex::new(BTreeSet::new()),
             writes: Mutex::new(BTreeSet::new()),
+            screening: Some(screening),
         })
     }
 
@@ -293,23 +325,39 @@ impl Pool {
     /// The indexers are permanent members of the read set, so callers pass
     /// only the session's own reads.
     pub async fn set_reads(&self, own_reads: &[String]) {
-        let mut urls: Vec<String> = INDEXERS.iter().map(|s| s.to_string()).collect();
-        urls.extend(own_reads.iter().cloned());
-        let keep: HashSet<&String> = urls.iter().collect();
-        let retired: Vec<String> = {
+        // The session's OWN reads are user-chosen: they dial direct (M5
+        // WP2's exemption is by name, and this is where the names come
+        // from). Retired reads lose the exemption with the relay.
+        let retired_reads: Vec<String>;
+        {
+            let urls: Vec<String> = INDEXERS.iter().map(|s| s.to_string()).collect();
+            let mut all = urls.clone();
+            all.extend(own_reads.iter().cloned());
+            let keep: HashSet<String> = all.into_iter().collect();
             let mut reads = self.reads.lock().unwrap();
-            let retired: Vec<String> = reads
+            retired_reads = reads
                 .iter()
                 .filter(|u| !keep.contains(*u))
                 .cloned()
                 .collect();
-            for u in &retired {
+            for u in &retired_reads {
                 reads.remove(u);
             }
-            retired
-        };
-        for url in retired {
-            let _ = self.client.remove_relay(&url).force().await;
+        }
+        for url in &retired_reads {
+            if let Ok(parsed) = url::Url::parse(url)
+                && let Some(host) = parsed.host_str() {
+                    crate::net_guard::disallow_direct_relay(host);
+            }
+            let _ = self.client.remove_relay(url).force().await;
+        }
+        let mut urls: Vec<String> = INDEXERS.iter().map(|s| s.to_string()).collect();
+        urls.extend(own_reads.iter().cloned());
+        for url in own_reads {
+            if let Ok(parsed) = url::Url::parse(url)
+                && let Some(host) = parsed.host_str() {
+                    crate::net_guard::allow_direct_relay(host);
+            }
         }
         for url in urls {
             self.reads.lock().unwrap().insert(url.clone());
@@ -761,6 +809,11 @@ impl Pool {
         };
         if !new_targets.is_empty() {
             for url in &new_targets {
+                // Own write relays are user-chosen (NIP-65): dial direct.
+                if let Ok(parsed) = url::Url::parse(url)
+                    && let Some(host) = parsed.host_str() {
+                        crate::net_guard::allow_direct_relay(host);
+                }
                 let _ = self
                     .client
                     .add_relay(url.clone())

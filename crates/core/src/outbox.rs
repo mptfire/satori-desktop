@@ -133,36 +133,8 @@ pub fn routable_relay(url: &str) -> bool {
 /// reserved ranges; IPv6 additionally unique-local/link-local/multicast,
 /// with v4-mapped addresses judged by their embedded v4.
 fn is_public_ip(ip: &std::net::IpAddr) -> bool {
-    match *ip {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
-            !(a == 0
-                || a == 10
-                || a == 127
-                || (a == 169 && b == 254)
-                || (a == 172 && (b & 0xf0) == 16)
-                || (a == 192 && b == 168)
-                || (a == 100 && (b & 0xc0) == 64)
-                || a >= 224)
-        }
-        std::net::IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            if seg[..5] == [0, 0, 0, 0, 0] && seg[5] == 0xffff {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    seg[6] as u8,
-                    (seg[7] >> 8) as u8,
-                    seg[7] as u8,
-                );
-                return is_public_ip(&std::net::IpAddr::V4(v4));
-            }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || (seg[0] & 0xffc0) == 0xfe80
-                || (seg[0] & 0xfe00) == 0xfc00
-                || (seg[0] & 0xff00) == 0xff00)
-        }
-    }
+    // M5: the rules live in net_guard — one authority, no drift.
+    crate::net_guard::is_public_unicast_ip(*ip)
 }
 
 // Caps (nip65.ts): 3 write relays per author considered; the greedy set-cover

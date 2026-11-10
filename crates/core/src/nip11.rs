@@ -121,7 +121,13 @@ pub async fn refresh(relay: &str) -> bool {
         return false;
     };
     let url = url.trim_end_matches('/').to_string();
-    let res = match tokio::time::timeout(FETCH_BUDGET, http().get(&url).send()).await {
+    // media::client() rides the guarded fetch (SafeResolver, redirect
+    // re-validation). Its longer connect/total timeouts never come into
+    // play: the outer FETCH_BUDGET still bounds the whole request at 8s.
+    let req = crate::media::client()
+        .get(&url)
+        .header("Accept", "application/nostr+json");
+    let res = match tokio::time::timeout(FETCH_BUDGET, req.send()).await {
         Ok(Ok(res)) => res,
         _ => return false,
     };
@@ -129,13 +135,13 @@ pub async fn refresh(relay: &str) -> bool {
         return false;
     }
     // Relay documents are small; refuse to read more than a sane body.
+    // read_capped STREAMS the cap: a declared-length lie dies up-front,
+    // and a chunked (undeclared) response is cut mid-stream instead of
+    // being read whole and measured after.
     const CAP: usize = 256 * 1024;
-    let body = match res.content_length() {
-        Some(n) if n as usize > CAP => return false,
-        _ => match res.bytes().await {
-            Ok(b) if b.len() <= CAP => b.to_vec(),
-            _ => return false,
-        },
+    let body = match crate::media::read_capped(res, CAP).await {
+        Ok(b) => b,
+        Err(_) => return false,
     };
     let doc: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(d) => d,
@@ -150,21 +156,6 @@ pub async fn refresh(relay: &str) -> bool {
     held.insert(key, Entry { search, at: now_secs() });
     write_disk(&held);
     true
-}
-
-/// One shared client (media.rs's three rules apply: a browser UA, connect
-/// + total timeouts; NIP-11 answers from CDNs 403 without a UA).
-fn http() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                         (KHTML, like Gecko) Chrome/126.0.0.1 Safari/537.36")
-            .connect_timeout(FETCH_BUDGET)
-            .timeout(FETCH_BUDGET)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
 }
 
 /// TTL-gated sweep over a whole relay set (the read set connects → the

@@ -23,10 +23,13 @@ use gpui_video_player::Video;
 
 use crate::views::content;
 
-/// The at-most-one player: the URL it plays + the pipeline handle.
+/// The at-most-one player: the URL it plays + the pipeline handle + the
+/// guarded door its bytes walk through (M5 WP3 — playbin never sees the
+/// origin URL; the RangeProxy dies with the Player).
 struct Player {
     url: String,
     video: Video,
+    proxy: Option<satori_core::video_proxy::RangeProxy>,
 }
 
 static ACTIVE: RwLock<Option<Player>> = RwLock::new(None);
@@ -100,10 +103,11 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
         }
         return;
     }
-    let Ok(parsed) = url::Url::parse(&url) else {
+    if url::Url::parse(&url).is_err() {
+        // Not a real URL at all — the browser can sort it out or not.
         cx.open_url(&url);
         return;
-    };
+    }
     // Already open or opening — a second tap on the same tile is a no-op,
     // not a second pipeline.
     if active(&url).is_some() || opening(&url) {
@@ -114,12 +118,37 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
         *g = Some(url.clone());
     }
     cx.set_global(Signal);
+    // M5 WP3: the guarded door. Playbin never sees the origin URL — its
+    // souphttpsrc resolves and redirects outside every guard we have.
+    // No door, no dial: degrade to the browser link, fail closed.
+    let proxy = match satori_core::video_proxy::RangeProxy::spawn(url.clone()) {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            if let Ok(mut g) = OPENING.write() {
+                *g = None;
+            }
+            cx.open_url(&url);
+            cx.set_global(Signal);
+            return;
+        }
+    };
+    let proxied = match url::Url::parse(&proxy.uri()) {
+        Ok(u) => u,
+        Err(_) => {
+            if let Ok(mut g) = OPENING.write() {
+                *g = None;
+            }
+            cx.open_url(&url);
+            cx.set_global(Signal);
+            return;
+        }
+    };
     // Video::new blocks up to ~5s (playbin state + caps) — the background
     // executor, never the UI thread.
     cx.spawn(async move |cx| {
         let res = cx
             .background_executor()
-            .spawn(async move { Video::new(&parsed) })
+            .spawn(async move { Video::new(&proxied) })
             .await;
         cx.update(|cx| {
             // Whatever the outcome, the wait is over.
@@ -140,6 +169,7 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
                         guard.replace(Player {
                             url: url.clone(),
                             video,
+                            proxy: Some(proxy),
                         })
                     };
                     if let Some(old) = old {

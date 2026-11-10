@@ -14,6 +14,7 @@ nostr-lmdb = { workspace = true }
 nostr-database = { workspace = true }
 nwc = { workspace = true }
 tokio = { workspace = true }
+rand = "0.8"
 tokio-socks = { workspace = true }
 futures-util = { workspace = true }
 keyring = { workspace = true }

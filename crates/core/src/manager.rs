@@ -1916,6 +1916,13 @@ impl Core {
     /// missed it" becomes provable from the log instead of a guess.
     async fn nostrconnect_probe(client_keys: Keys, relay: String, done: tokio::sync::oneshot::Receiver<()>) {
         use futures_util::StreamExt as _;
+        // The login relay is user-supplied (typed/QR'd seconds ago):
+        // user-chosen class, dials direct like the rest of the
+        // exemptions (M5 WP2's policy boundary).
+        if let Ok(parsed) = url::Url::parse(&relay)
+            && let Some(host) = parsed.host_str() {
+                crate::net_guard::allow_direct_relay(host);
+        }
         let probe = nostr_sdk::client::ClientBuilder::new().build();
         if let Err(e) = probe.add_relay(&relay).await {
             crate::dlog!("nostrconnect probe: relay add failed: {e}");
