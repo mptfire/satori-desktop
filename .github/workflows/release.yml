@@ -31,10 +31,10 @@ jobs:
   build-linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install the client libraries satori links
         run: |
@@ -56,14 +56,14 @@ jobs:
 
       - name: Build the deb
         run: |
-          cargo install cargo-deb --locked
+          cargo install cargo-deb --locked --version 3.8.0
           cargo deb -p satori-gpui --no-build
           # Smoke: the deb parses and its payload carries the expected paths.
           dpkg-deb --info target/debian/*.deb | head -20
 
       - name: Build the rpm
         run: |
-          cargo install cargo-generate-rpm --locked
+          cargo install cargo-generate-rpm --locked --version 0.21.1
           # -p takes the package DIRECTORY path, not the crate name.
           cargo generate-rpm -p crates/app-gpui
           # Smoke: the rpm reads back (rpmlint is not installed; the
@@ -71,7 +71,7 @@ jobs:
           rpm -q --info target/generate-rpm/*.rpm || rpm2cpio target/generate-rpm/*.rpm | cpio -it | head
 
       - name: Attach the artifacts to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
         with:
           files: |
             target/release/satori-desktop
@@ -93,7 +93,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the toolchain and libraries
         run: |
@@ -106,6 +106,12 @@ jobs:
           sudo apt-get install -y pkg-config libfontconfig-dev libfreetype-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
             libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install the Rust toolchain
+        # The runner's preinstalled rust is whatever the image shipped
+        # that day — pin both arch legs to the same toolchain the x86_64
+        # job builds with.
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Build the release binary
         run: cargo build --release --locked -p satori-gpui
@@ -138,7 +144,7 @@ jobs:
             io.github.Letdown2491.satori stable
 
       - name: Attach the flatpak bundles to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
         with:
           files: bundles/*.flatpak
           generate_release_notes: true
@@ -148,7 +154,7 @@ jobs:
         # metadata), not the bundle. One tar per leg; the publish job
         # prepares both trees and signs the listing once.
         run: tar -C self/tree -czf app-tree.tar.gz export files metadata
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: app-tree-${{ matrix.arch }}
           path: app-tree.tar.gz
@@ -161,7 +167,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Version from the tag
         id: ver
@@ -178,7 +184,7 @@ jobs:
           cargo install --locked --path crates/orchard-publish
 
       - name: Download the staged trees
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: app-tree-*
           path: trees
