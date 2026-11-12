@@ -27,6 +27,10 @@ use crate::views::content;
 struct Player {
     url: String,
     video: Video,
+    // Holds the RangeProxy alive; Drop aborts the listener. Never read
+    // directly — it's a lifetime anchor, not a functional field.
+    #[allow(dead_code)]
+    proxy: Option<satori_core::video_proxy::RangeProxy>,
 }
 
 static ACTIVE: RwLock<Option<Player>> = RwLock::new(None);
@@ -104,6 +108,23 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
         cx.open_url(&url);
         return;
     };
+    let _ = parsed; // superseded by proxied; the parsed URL was only the scheme check
+    // WP3: playbin never sees the origin URL. Spawn the loopback range-proxy
+    // now, on the UI thread (cheap: bind + spawn task); hand its token URL
+    // to Video::new. Fail closed: proxy error → browser fallback, no direct dial.
+    let proxy = match satori_core::video_proxy::spawn(url.clone()) {
+        Ok(p) => p,
+        Err(_) => {
+            cx.open_url(&url);
+            return;
+        }
+    };
+    let proxied_url_str = proxy.uri();
+    let Ok(proxied) = url::Url::parse(&proxied_url_str) else {
+        drop(proxy);
+        cx.open_url(&url);
+        return;
+    };
     // Already open or opening — a second tap on the same tile is a no-op,
     // not a second pipeline.
     if active(&url).is_some() || opening(&url) {
@@ -119,7 +140,7 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
     cx.spawn(async move |cx| {
         let res = cx
             .background_executor()
-            .spawn(async move { Video::new(&parsed) })
+            .spawn(async move { Video::new(&proxied) })
             .await;
         cx.update(|cx| {
             // Whatever the outcome, the wait is over.
@@ -140,6 +161,7 @@ pub fn open(url: String, mime: Option<String>, cx: &mut gpui::App) {
                         guard.replace(Player {
                             url: url.clone(),
                             video,
+                            proxy: Some(proxy),
                         })
                     };
                     if let Some(old) = old {

@@ -46,7 +46,7 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_documentation()
                 || o[0] == 0 // this-network (0.0.0.0/8)
-                || o[0] == 100 // shared address space (CGNAT, 100.64/10)
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT (100.64/10), not the whole 100/8
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18/15 benchmark
                 || o[0] >= 240) // reserved + broadcast
@@ -315,11 +315,24 @@ pub fn user_chosen_relay(url: &str) -> bool {
 }
 
 fn normalize_host(host: &str) -> String {
-    host.trim()
-        .trim_end_matches('.')
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase()
+    let host = host.trim().trim_end_matches('.');
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Strip a ":<port>" suffix. Parsed URLs usually arrive portless via
+    // host_str(), but accept(string) callers or login paths may hand us
+    // "host:port" — without stripping, the lookup silently never matches.
+    // Only strip if the suffix is purely numeric (real port), leaving
+    // hostnames that legitimately contain colons (none in practice) intact.
+    let host = if let Some(idx) = host.rfind(':') {
+        let tail = &host[idx + 1..];
+        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+            &host[..idx]
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+    host.to_ascii_lowercase()
 }
 
 #[cfg(test)]

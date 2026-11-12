@@ -244,6 +244,9 @@ pub struct Pool {
     /// attempt. Targets always come from the caller's list, so a relay
     /// the user dropped simply stops being targeted.
     writes: Mutex<BTreeSet<String>>,
+    /// The screening transport (M5 WP2). Held for the pool's lifetime; every
+    /// relay NOT in net_guard's direct-dial ledger routes through it.
+    screening: crate::socks::ScreeningSocks,
 }
 
 impl Pool {
@@ -253,6 +256,13 @@ impl Pool {
     }
 
     pub async fn open() -> Result<Self, SdkError> {
+        // The screening transport must exist before the client builds: a relay
+        // connection that bypasses the screening path is an SSRF open door. Fail
+        // closed if the loopback listener can't bind.
+        let screening = crate::socks::spawn()
+            .await
+            .map_err(|e| SdkError::other(format!("screening transport: {e}")))?;
+        let socks_addr = screening.addr();
         let store = Store::open().await?;
         // No keys live in the client: NIP-42 AUTH challenges are answered
         // with the session identity (set_identity, below) — the owner's
@@ -263,7 +273,26 @@ impl Pool {
         let client = ClientBuilder::new()
             .database(store.database())
             .authenticator(PoolAuthenticator(identity.clone()))
+            .proxy(Proxy::custom(move |url| {
+                // user_chosen_relay consults the shared net_guard direct-dial
+                // ledger; D58's paste screens grant into the same ledger, so a
+                // consent-granted relay dials direct without a second exemption.
+                if crate::net_guard::user_chosen_relay(url.as_str()) {
+                    None
+                } else {
+                    Some(socks_addr)
+                }
+            }))
             .build();
+        // The house indexers are trusted app constants — seed the direct-dial
+        // ledger before anything else connects.
+        for indexer in INDEXERS {
+            if let Ok(parsed) = url::Url::parse(indexer)
+                && let Some(host) = parsed.host_str()
+            {
+                crate::net_guard::allow_direct_relay(host);
+            }
+        }
         Ok(Self {
             client,
             store,
@@ -271,6 +300,7 @@ impl Pool {
             routed: Mutex::new(HashMap::new()),
             reads: Mutex::new(BTreeSet::new()),
             writes: Mutex::new(BTreeSet::new()),
+            screening,
         })
     }
 
@@ -316,8 +346,18 @@ impl Pool {
         };
         for url in retired {
             let _ = self.client.remove_relay(&url).force().await;
+            if let Ok(parsed) = url::Url::parse(&url)
+                && let Some(host) = parsed.host_str()
+            {
+                crate::net_guard::disallow_direct_relay(host);
+            }
         }
         for url in urls {
+            if let Ok(parsed) = url::Url::parse(&url)
+                && let Some(host) = parsed.host_str()
+            {
+                crate::net_guard::allow_direct_relay(host);
+            }
             self.reads.lock().unwrap().insert(url.clone());
             // Read-scoped capability; bad relay = skip.
             let _ = self
@@ -777,6 +817,11 @@ impl Pool {
         };
         if !new_targets.is_empty() {
             for url in &new_targets {
+                if let Ok(parsed) = url::Url::parse(url)
+                    && let Some(host) = parsed.host_str()
+                {
+                    crate::net_guard::allow_direct_relay(host);
+                }
                 let _ = self
                     .client
                     .add_relay(url.clone())
