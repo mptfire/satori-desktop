@@ -76,7 +76,8 @@ pub enum FeedEvent {
     /// Older page + has-more.
     Older(FeedPage, bool),
     Replies(Vec<Event>, Vec<Profile>),
-    /// Notifications (replies + mentions; reactions stay off by default).
+    /// Notifications (own-note replies; plain ancestor mentions omitted;
+    /// engagement reactions stay behind the existing pref).
     Notifications(Vec<Event>, Vec<Profile>),
     /// Whether the bell should light (unread past high-water).
     NotifDot(bool),
@@ -440,7 +441,8 @@ pub enum PostKind {
 /// NIP-78 login sync) that ride the same broadcast for want of a second one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Live {
-    /// A reply or mention tagging me (#p) — light the bell.
+    /// A reply on your own note (#e) or a profile zap (#p) — light the
+    /// bell. Ancestor-only mentions don't produce a notification signal.
     Mention,
     /// A fresh post from a follow — bump the timeline's new-notes pill.
     Post,
@@ -3125,9 +3127,9 @@ impl Core {
 
     // --- notifications ------------------------------------------------------------
 
-    /// The notification stream (port of `src/data/notifications.ts`, slice 1):
-    /// replies to my notes + mentions (#p=me), newest first, own events
-    /// dropped, reactions/poll-votes/zap classes land with their milestones.
+    /// The notification stream: replies to your own notes (#e),
+    /// profile-directed zaps and other deliberate engagement, newest
+    /// first. Ordinary ancestor mentions are intentionally not included.
     pub fn notifications(self: &Arc<Self>) -> FeedRx {
         let (tx, rx) = mpsc::unbounded_channel();
         let this = Arc::clone(self);
@@ -3231,17 +3233,19 @@ impl Core {
                     .saturating_sub(7 * 86400);
 
                 // Mentions (#p=me) and replies (#e=my notes): PARALLEL.
-                // (The pref was already read for the cached phase — no
-                // second disk read here.)
-                let mut mention_kinds =
-                    vec![Kind::TextNote, Kind::Custom(1111), Kind::Custom(9735)];
+                // The pane is scoped to replies on your notes, not every
+                // #p carried along a whole thread. Mentions without an #e
+                // to one of your notes do not ring the bell; the dedicated
+                // reply/quote/repost/vote queries below cover intentional
+                // engagements independently.
+                let mut engagement_kinds = vec![Kind::Custom(9735)];
                 if reaction_notifs {
-                    mention_kinds.push(Kind::Reaction);
+                    engagement_kinds.push(Kind::Reaction);
                 }
                 let mention_q = Box::pin(
                     active.pool.get(
                         Filter::new()
-                            .kinds(mention_kinds)
+                            .kinds(engagement_kinds)
                             .pubkeys([me])
                             .since(Timestamp::from(since))
                             .limit(200),
@@ -6540,9 +6544,9 @@ impl Core {
         let _ = self.hold_tx.send(ev.clone());
     }
 
-    /// ONE persistent subscription per session, three filters: fresh posts
-    /// from follows (timeline pill), #p me (bell — every NIP-10/NIP-22 reply
-    /// tags the parent author), kind-5 deletions (render filter). First-seen
+    /// ONE persistent subscription per session: fresh posts from follows,
+    /// replies/comments on the user's own notes (#e), profile-directed
+    /// zaps, and deletions. A generic ancestor #p does not light the bell. First-seen
     /// events route to broadcast signals; everything saves to the store.
     /// Follows are snapshotted at start — a mid-session follow change rides
     /// the next refresh's fetches until the next session.
@@ -6565,16 +6569,21 @@ impl Core {
         let my_epoch = live_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let me = active.me();
         let follows = active.follows.clone();
+        // Same recent-own-note bound as the notification history. Direct
+        // #e references are objective: inherited ancestor p tags don't
+        // make an unrelated thread into your activity.
+        let own_note_ids: HashSet<EventId> = active
+            .pool
+            .store
+            .feed_page(&[me], None, 500)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
         self.rt.spawn(async move {
             let now = Timestamp::now();
-            // NIP-01: an empty list can never match — the follows-scoped
-            // filters join only when there are follows to scope by.
-            let mut filters = vec![
-                Filter::new()
-                    .kinds([Kind::TextNote, Kind::Custom(1111), Kind::Custom(9735)])
-                    .pubkey(me)
-                    .since(now),
-            ];
+            let mut filters = live_direct_notification_filters(me, &own_note_ids, now);
             if !follows.is_empty() {
                 filters.push(
                     Filter::new()
@@ -6693,7 +6702,9 @@ impl Core {
                 if crate::dedup::observe(&event, relay_url.as_str()) {
                     continue;
                 }
-                let sig = if event.tags.clone().public_keys().any(|pk| pk == me) {
+                let sig = if should_ring_direct_notification(event.kind, event.pubkey, me) {
+                    // Only others can notify us. Own events from this or
+                    // another device are still live feed state, not alerts.
                     Some(Live::Mention)
                 } else {
                     Some(Live::Post)
@@ -6721,6 +6732,35 @@ impl Core {
             LoginError::Resume("no active session".into())
         })
     }
+}
+
+fn should_ring_direct_notification(kind: Kind, author: PublicKey, me: PublicKey) -> bool {
+    author != me && matches!(u16::from(kind), 1 | 1111 | 9735)
+}
+
+fn live_direct_notification_filters(
+    me: PublicKey,
+    own_note_ids: &HashSet<EventId>,
+    since: Timestamp,
+) -> Vec<Filter> {
+    // A general `#p=me` subscription is ancestor-driven: every reply in a
+    // long thread may carry the owner's key. Only query text replies by the
+    // note IDs; profile-directed zaps retain their own independent #p path.
+    let mut filters = vec![
+        Filter::new()
+            .kind(Kind::Custom(9735))
+            .pubkey(me)
+            .since(since),
+    ];
+    if !own_note_ids.is_empty() {
+        filters.push(
+            Filter::new()
+                .kinds([Kind::TextNote, Kind::Custom(1111)])
+                .events(own_note_ids.iter().copied())
+                .since(since),
+        );
+    }
+    filters
 }
 
 fn now_secs() -> u64 {
@@ -7321,6 +7361,75 @@ mod tests {
         let bad = vec!["url https://cdn.example.com/x.png".to_string()];
         let (_, tags) = Core::note_tags("x".into(), None, Vec::new(), None, &[bad], me);
         assert!(tags.iter().all(|t| t.kind() != "imeta"));
+    }
+
+    #[test]
+    fn direct_note_live_filters_prefer_owned_event_ids_over_thread_mentions() {
+        let me = Keys::generate().public_key();
+        let mine = EventId::from_byte_array([1u8; 32]);
+        let ids = std::collections::HashSet::from([mine]);
+        let filters = live_direct_notification_filters(me, &ids, Timestamp::from(123));
+        let fields = |wanted: u16| {
+            serde_json::to_value(&filters)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["kinds"].as_array().unwrap().contains(&wanted.into()))
+                .unwrap()
+                .clone()
+        };
+        let replies = fields(1);
+        assert_eq!(replies["#e"], serde_json::json!([mine.to_string()]));
+        assert!(
+            replies.get("#p").is_none(),
+            "plain ancestor #p=me is not the direct-reply query"
+        );
+        assert_eq!(fields(1111)["#e"], serde_json::json!([mine.to_string()]));
+        assert_eq!(fields(9735)["#p"], serde_json::json!([me.to_string()]));
+        assert!(
+            fields(9735).get("#e").is_none(),
+            "profile zaps have no e requirement"
+        );
+    }
+
+    #[test]
+    fn direct_note_live_filters_allow_zaps_without_own_note_ids() {
+        let filters = live_direct_notification_filters(
+            Keys::generate().public_key(),
+            &std::collections::HashSet::new(),
+            Timestamp::from(123),
+        );
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&filters).unwrap()[0]["kinds"],
+            serde_json::json!([9735])
+        );
+    }
+
+    #[test]
+    fn direct_note_live_signals_never_include_own_events() {
+        let me = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        assert!(!should_ring_direct_notification(Kind::TextNote, me, me));
+        assert!(!should_ring_direct_notification(Kind::Custom(1111), me, me));
+        assert!(!should_ring_direct_notification(Kind::Custom(9735), me, me));
+        assert!(should_ring_direct_notification(Kind::TextNote, other, me));
+        assert!(should_ring_direct_notification(
+            Kind::Custom(1111),
+            other,
+            me
+        ));
+        assert!(should_ring_direct_notification(
+            Kind::Custom(9735),
+            other,
+            me
+        ));
+        assert!(!should_ring_direct_notification(
+            Kind::ContactList,
+            other,
+            me
+        ));
     }
 
     /// NIP-92 kind-0 adoption: the banner's blurhash arrives only from an
