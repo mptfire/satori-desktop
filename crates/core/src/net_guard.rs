@@ -371,6 +371,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cgnat_only_refuses_the_10_block() {
+        assert!(!is_public_ip(&"100.64.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"100.127.255.254".parse().unwrap()));
+        assert!(is_public_ip(&"100.63.255.255".parse().unwrap()));
+        assert!(is_public_ip(&"100.128.0.1".parse().unwrap()));
+    }
+
     // --- the authority: v6 (incl. transition mechanisms) ------------------
 
     #[test]
@@ -471,10 +479,10 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let res = resolve_pinned_public("localhost", 8080).await;
-            assert!(matches!(
-                res,
-                Err(NetGuardError::NonPublic(_)) | Err(NetGuardError::Resolve(_))
-            ));
+            assert!(
+                matches!(res, Err(NetGuardError::NonPublic(ref host)) if host == "localhost"),
+                "a resolved non-public answer must be NetGuardError::NonPublic, not resolver weather: {res:?}"
+            );
         });
     }
 
@@ -486,6 +494,11 @@ mod tests {
         assert!(!user_chosen_relay(url));
         allow_direct_relay("UMBREL.local");
         assert!(user_chosen_relay(url), "normalization folds case");
+        allow_direct_relay("Example.COM:7443");
+        assert!(
+            user_chosen_relay("wss://example.com:7443"),
+            "a listener or accept-style host:port grant uses the same normalization as a URL"
+        );
         disallow_direct_relay("umbrel.local");
         assert!(!user_chosen_relay(url));
         // Garbage URLs are never "user chosen".
