@@ -100,7 +100,7 @@ impl LoginView {
         self.connecting = true;
         let rx = self
             .core
-            .connect_nostrconnect("wss://relay.nip46.com".into());
+            .connect_nostrconnect("wss://relay.primal.net".into());
         let mut rx = rx;
         dlog!("[login] nostrconnect pump armed (generation {generation})");
         cx.spawn(async move |this, cx| {
@@ -650,7 +650,7 @@ mod scratch {
         use nostr::prelude::*;
         let uri = NostrConnectUri::client(
             keys.public_key(),
-            [RelayUrl::parse("wss://relay.nip46.com").unwrap()],
+            [RelayUrl::parse("wss://relay.primal.net").unwrap()],
             "Satori",
         );
         let s = uri.to_string();
