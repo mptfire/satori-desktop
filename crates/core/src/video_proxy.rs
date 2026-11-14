@@ -328,8 +328,8 @@ mod tests {
         // The token is the path segment between the host:port and /stream.
         let token = uri
             .trim_start_matches("http://127.0.0.1:")
-            .splitn(2, '/')
-            .nth(1)
+            .split_once('/')
+            .map(|(_, token)| token)
             .unwrap_or("")
             .trim_end_matches("/stream")
             .trim_end_matches('/');

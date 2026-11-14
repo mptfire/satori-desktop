@@ -71,19 +71,22 @@ fn main() {
                         .map(|(_, w, h)| format!("{w}x{h}"))
                         .unwrap_or_else(|| "pending".into())
                 );
-                if let Some((bytes, width, height)) = frame {
-                    if !bytes.is_empty() && width > 0 && height > 0 && !position.is_zero() {
-                        println!(
-                            "SMOKE PASS: proxy + GStreamer decoded a {}x{} NV12 frame ({} bytes), position {}ms, {} fps, duration {}ms",
-                            width,
-                            height,
-                            bytes.len(),
-                            position.as_millis(),
-                            video.framerate(),
-                            video.duration().as_millis()
-                        );
-                        std::process::exit(0);
-                    }
+                if let Some((bytes, width, height)) = frame
+                    && !bytes.is_empty()
+                    && width > 0
+                    && height > 0
+                    && !position.is_zero()
+                {
+                    println!(
+                        "SMOKE PASS: proxy + GStreamer decoded a {}x{} NV12 frame ({} bytes), position {}ms, {} fps, duration {}ms",
+                        width,
+                        height,
+                        bytes.len(),
+                        position.as_millis(),
+                        video.framerate(),
+                        video.duration().as_millis()
+                    );
+                    std::process::exit(0);
                 }
             }
             eprintln!("SMOKE FAIL: no decoded frame and advancing playhead within 45 seconds");

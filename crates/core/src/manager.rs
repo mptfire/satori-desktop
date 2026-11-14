@@ -7306,7 +7306,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            &[imeta.clone()],
+            std::slice::from_ref(&imeta),
             me,
         );
         assert_eq!(content, "look at this");
