@@ -11,6 +11,7 @@ mod input;
 mod markdown;
 mod media;
 mod media_guard;
+mod og;
 mod poster;
 mod prefs;
 mod theme;

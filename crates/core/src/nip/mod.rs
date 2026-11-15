@@ -14,6 +14,7 @@
 //! | `wiki` | 54 — wiki topics (AsciiDoc subset) |
 //! | `repo` | 34 — git repositories |
 //! | `nip78` | 78 — app data (encrypted prefs sync) |
+//! | `nip19` | 19 — bech32 entities (the shareable nevent/naddr) |
 //!
 //! NIP-96 stays rejected; Blossom only (matches the web app).
 
@@ -26,6 +27,7 @@ pub mod goal;
 pub mod highlight;
 pub mod imeta;
 pub mod nip10;
+pub mod nip19;
 pub mod nip78;
 pub mod podcast;
 pub mod poll;

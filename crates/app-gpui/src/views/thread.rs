@@ -565,9 +565,20 @@ fn reply_row(
                         ),
                 )
                 .child(
-                    // The timestamp is the third mode toggle (timefmt.rs):
-                    // tap cycles relative → date → block height.
-                    content::time_toggle(SharedString::from(format!("reply-time-{idx}")), time),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(content::copy_seal(
+                            &format!("reply-{idx}"),
+                            satori_core::nip::nip19::uri(ev),
+                        ))
+                        // The timestamp is the third mode toggle (timefmt.rs):
+                        // tap cycles relative → date → block height.
+                        .child(content::time_toggle(
+                            SharedString::from(format!("reply-time-{idx}")),
+                            time,
+                        )),
                 ),
         )
         .child(
@@ -635,9 +646,25 @@ impl Render for ThreadView {
                     painted.push(url);
                 }
             }
+            // The og card's thumbnail paints preview.image — a URL the
+            // parse never knew. Re-request (and pin) it like any picture.
+            for url in content::og_image_urls(a) {
+                let fresh = !painted.contains(&url);
+                media::fetch(&self.core, url.clone(), viewer, cx);
+                if fresh {
+                    painted.push(url);
+                }
+            }
         }
         for (ev, _) in &self.replies {
             for url in content::media_urls_cached(ev).iter().cloned() {
+                let fresh = !painted.contains(&url);
+                media::fetch(&self.core, url.clone(), viewer, cx);
+                if fresh {
+                    painted.push(url);
+                }
+            }
+            for url in content::og_image_urls(ev) {
                 let fresh = !painted.contains(&url);
                 media::fetch(&self.core, url.clone(), viewer, cx);
                 if fresh {

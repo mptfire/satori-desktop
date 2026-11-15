@@ -197,6 +197,11 @@ pub fn at_icon(color: u32) -> impl IntoElement {
     icon(at_sign, color, 18.0)
 }
 
+/// The copy-the-id seal (timestamp row): two stacked sheets, small.
+pub fn copy_icon(color: u32) -> impl IntoElement {
+    icon(copy, color, 14.0)
+}
+
 pub fn check_icon(color: u32) -> impl IntoElement {
     icon(check, color, 18.0)
 }
@@ -252,6 +257,11 @@ pub fn hash_icon(color: u32) -> impl IntoElement {
 /// hash (a tag).
 pub fn wire_icon(color: u32) -> impl IntoElement {
     icon(wire, color, 20.0)
+}
+
+/// The add-column button (rail slot in columns mode).
+pub fn plus_icon(color: u32) -> impl IntoElement {
+    icon(plus, color, 20.0)
 }
 
 // The ensō — the brush circle with a gap, drawn as a slightly spiralling
@@ -312,6 +322,26 @@ fn magnifier(b: &mut PathBuilder, g: &Grid) {
     circle(b, g, 10.5, 10.5, 6.2);
     b.move_to(g.p(15.2, 15.2));
     b.line_to(g.p(20.2, 20.2));
+}
+
+/// A stroke rectangle with softly cut corners (the copy glyph's sheets).
+fn sheet(b: &mut PathBuilder, g: &Grid, x0: f32, y0: f32, x1: f32, y1: f32) {
+    let r = 2.0;
+    b.move_to(g.p(x0 + r, y0));
+    b.line_to(g.p(x1 - r, y0));
+    b.line_to(g.p(x1, y0 + r));
+    b.line_to(g.p(x1, y1 - r));
+    b.line_to(g.p(x1 - r, y1));
+    b.line_to(g.p(x0 + r, y1));
+    b.line_to(g.p(x0, y1 - r));
+    b.line_to(g.p(x0, y0 + r));
+    b.close();
+}
+
+// The copy glyph: two stacked sheets (the copy-the-id seal).
+fn copy(b: &mut PathBuilder, g: &Grid) {
+    sheet(b, g, 8.5, 8.5, 21.0, 21.0);
+    sheet(b, g, 3.0, 3.0, 15.5, 15.5);
 }
 
 // The bell: dome with a smile-arc clapper.
@@ -397,6 +427,14 @@ fn arrow_up(b: &mut PathBuilder, g: &Grid) {
     b.move_to(g.p(6.5, 11.0));
     b.line_to(g.p(12.0, 5.5));
     b.line_to(g.p(17.5, 11.0));
+}
+
+/// The add-column button (D68's rail slot): a plain plus.
+fn plus(b: &mut PathBuilder, g: &Grid) {
+    b.move_to(g.p(12.0, 5.0));
+    b.line_to(g.p(12.0, 19.0));
+    b.move_to(g.p(5.0, 12.0));
+    b.line_to(g.p(19.0, 12.0));
 }
 
 /// The columns workspace (D68): a triptych — three pane strokes.

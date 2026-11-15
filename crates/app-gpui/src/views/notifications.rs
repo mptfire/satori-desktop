@@ -484,6 +484,14 @@ impl NotificationsView {
                     painted.push(url);
                 }
             }
+            // The og card's thumbnail paints preview.image — a URL the
+            // parse never knew. Re-pin it like any picture (the row's own
+            // item closure re-requests it; this set is the pin).
+            for url in content::og_image_urls(ev) {
+                if !painted.contains(&url) {
+                    painted.push(url);
+                }
+            }
         }
         media::repin(cx.entity_id(), painted, cx);
     }
@@ -912,6 +920,9 @@ fn notif_card(
             time,
             format!("notif-{idx}"),
             Some(ev.pubkey),
+            // No id seal: the header announces an action on some other
+            // note — the seal would copy the announcement, not the note.
+            None,
             handle.clone(),
         ));
     if let Some(pid) = &parent_id
@@ -1189,6 +1200,37 @@ impl Render for NotificationsView {
                                     let secs = ev.created_at.as_secs();
                                     let time = crate::timefmt::stamp(secs, cx);
                                     crate::timefmt::ensure(secs, cx);
+                                    // Evicted media comes back on render —
+                                    // want_media only runs at rebuild, so
+                                    // once the cache dropped a row's image
+                                    // under feed-photo pressure nothing
+                                    // asked again and the tile went dark
+                                    // mid-session (the disappearing-image
+                                    // class; feed.rs's item closure is the
+                                    // same backstop). fetch is a silent
+                                    // no-op for entries the cache holds;
+                                    // only a landing notifies, so this
+                                    // can't loop a render. (pin_window's
+                                    // old comment claimed notif_card did
+                                    // this — it never did.)
+                                    if let Some(p) = profiles.get(&ev.pubkey.to_string())
+                                        && !p.picture.is_empty()
+                                    {
+                                        media::fetch(
+                                            &core,
+                                            p.picture.clone(),
+                                            list_handle.entity_id(),
+                                            cx,
+                                        );
+                                    }
+                                    for u in content::media_urls_cached(ev).iter().cloned() {
+                                        if !u.is_empty() {
+                                            media::fetch(&core, u, list_handle.entity_id(), cx);
+                                        }
+                                    }
+                                    for u in content::og_image_urls(ev) {
+                                        media::fetch(&core, u, list_handle.entity_id(), cx);
+                                    }
                                     let id_hex = ev.id.to_string();
                                     // The notification IS the reply.
                                     let st = engagement.action_state(&id_hex, 0, reduced_motion);

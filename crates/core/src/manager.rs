@@ -157,6 +157,12 @@ static SUPPRESSED_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 static SUPPRESSED_FLUSHER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static SUPPRESSED_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// One wot source fetch per launch (spawn_wot_source_fetch's doc): a
+/// bootstrap runs per Feed surface, and each used to re-fire the same
+/// 217-target routed fan-out.
+static WOT_SOURCE_FETCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn suppressed_dirty() {
     SUPPRESSED_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
     SUPPRESSED_FLUSHER.get_or_init(|| {
@@ -1261,6 +1267,15 @@ impl Core {
         if crate::wot::status() == crate::wot::WotStatus::OverCap {
             return; // the graph shut off; fetching sources feeds nothing
         }
+        // Session guard (perf lens): bootstrap runs once per Feed surface —
+        // every pane creation used to re-fire this routed fan-out for the
+        // same stale set (the targets stay stale until lists land, so N
+        // panes = N redundant full fan-outs). One attempt per launch; a
+        // round that returns NOTHING clears the guard so the next
+        // bootstrap retries what the dead pool missed.
+        if WOT_SOURCE_FETCHED.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let targets = crate::wot::fetch_targets(
             follows,
             cached,
@@ -1283,6 +1298,9 @@ impl Core {
             let got = pool
                 .get_routed(vec![Kind::ContactList], &targets, None, None, limit)
                 .await;
+            if got.is_empty() {
+                WOT_SOURCE_FETCHED.store(false, Ordering::SeqCst);
+            }
             eprintln!(
                 "[core] wot: source fetch returned {} list(s) for {} target(s)",
                 got.len(),
@@ -1396,6 +1414,21 @@ impl Core {
         self.task_once(|| Box::pin(async move { crate::media::fetch_json(&url).await.ok() }))
     }
 
+    /// A link's og: preview metadata (the link-preview card's fields), on
+    /// the core runtime for the same reason fetch_poster is: the guarded
+    /// fetch and the cache IO need the tokio context. The channel is
+    /// fetch_json's exact seam; the receiver is the UI's notify point.
+    pub fn fetch_link_preview(
+        self: &Arc<Self>,
+        url: String,
+    ) -> mpsc::UnboundedReceiver<
+        std::result::Result<crate::media::LinkPreview, crate::media::MediaError>,
+    > {
+        self.task_once(move || {
+            Box::pin(async move { crate::media::fetch_link_preview(&url).await })
+        })
+    }
+
     /// NIP-05 verification: does `domain`'s /.well-known/nostr.json vouch
     /// that `name` maps to this pubkey? One SSRF-guarded JSON fetch (the
     /// same path the zap invoice rides). `None` = unproven (fetch failed,
@@ -1434,11 +1467,12 @@ impl Core {
         url: String,
         cap: usize,
         sniff: impl FnOnce(&[u8]) -> std::result::Result<(u32, u32, Vec<u8>), ()> + Send + 'static,
+        sniff_uri: impl FnOnce(&str) -> std::result::Result<(u32, u32, Vec<u8>), ()> + Send + 'static,
     ) -> mpsc::UnboundedReceiver<
         std::result::Result<crate::media::DecodedImage, crate::media::MediaError>,
     > {
         self.task_once(move || {
-            Box::pin(async move { crate::media::fetch_poster(url, cap, sniff).await })
+            Box::pin(async move { crate::media::fetch_poster(url, cap, sniff, sniff_uri).await })
         })
     }
 
@@ -2964,16 +2998,29 @@ impl Core {
     }
 
     /// Newest page (home button): relay fetch since the newest known note.
+    /// Paint-first: the live sub has already persisted every pushed note,
+    /// so a store projection IS the news — the relay fan-out is a
+    /// deepener whose second Loaded dedups in the pane (note_ids). The
+    /// badge's click-to-paint delay was this fan-out gating the paint.
     pub fn refresh(self: &Arc<Self>, kinds: Vec<Kind>) -> FeedRx {
         let (tx, rx) = mpsc::unbounded_channel();
         // Single-flight (audit perf M4): overlapping refreshes stacked
-        // full routed fan-outs. A click while one runs drops the new tx —
-        // the caller's pump sees the closed channel and exits quietly;
-        // the running refresh lands its Loaded anyway.
+        // full routed fan-outs. A click while one runs used to drop the
+        // new tx — the caller's pump saw the closed channel and exited,
+        // a visible no-op; now it paints the store page (the in-flight
+        // refresh deepens further).
         if self
             .refreshing
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
+            let this = Arc::clone(self);
+            self.rt.spawn(async move {
+                if let Ok(active) = this.active().await
+                    && let Ok(page) = this.page_from_store(&active, None, &kinds).await
+                {
+                    let _ = tx.send(FeedEvent::Loaded(page));
+                }
+            });
             return rx;
         }
         let this = Arc::clone(self);
@@ -2997,6 +3044,10 @@ impl Core {
         if follows.is_empty() {
             return self.bootstrap_inner(tx, kinds).await;
         }
+        // The store paints NOW (see refresh's doc): the badge's promise is
+        // the notes the live sub already saved, and they are on disk.
+        let page = self.page_from_store(&active, None, &kinds).await?;
+        let _ = tx.send(FeedEvent::Loaded(page));
         // The 'since' probe: newest known kind-1 (newest_created_at docs:
         // the all-kinds page materialized one event per author-kind pair,
         // ~7,000 for 500 follows, on every refresh). A kind-1-only newest
@@ -3284,6 +3335,12 @@ impl Core {
         Ok(FeedPage { notes, profiles })
     }
 
+    /// Cached profiles for a page's authors. Missing metadata is NOT
+    /// fetched here — this sat between the deep fetch and every page
+    /// landing (bootstrap, badge click, older), gating the paint on a
+    /// client-wide relay round trip. The misses go to the profiles
+    /// service's background warm instead; the reactive machinery (the
+    /// panes' ensure_profiles pumps) patches names/avatars as they land.
     async fn profiles_for(active: &Active, notes: &[Event]) -> Vec<Profile> {
         let authors: Vec<PublicKey> = notes.iter().map(|e| e.pubkey).collect();
         let cached = active
@@ -3292,34 +3349,12 @@ impl Core {
             .profiles(&authors)
             .await
             .unwrap_or_default();
-        let mut profiles: Vec<Profile> = cached.iter().filter_map(Profile::from_event).collect();
-        // Fresh metadata for authors missing from the cache.
-        let mut seen = std::collections::HashSet::new();
+        let profiles: Vec<Profile> = cached.iter().filter_map(Profile::from_event).collect();
         let missing: Vec<PublicKey> = authors
-            .iter()
+            .into_iter()
             .filter(|a| !profiles.iter().any(|p| p.pubkey == a.to_string()))
-            .filter(|a| seen.insert(a.to_string()))
-            .cloned()
             .collect();
-        if !missing.is_empty() {
-            let filter = Filter::new()
-                .kind(Kind::Metadata)
-                .authors(missing.clone())
-                .limit(500);
-            // The SDK saves what it receives; `fresh` reads the store.
-            let _ = active.pool.get(filter).await;
-            let fresh = active
-                .pool
-                .store
-                .profiles(&missing)
-                .await
-                .unwrap_or_default();
-            for p in fresh.iter().filter_map(Profile::from_event) {
-                if !profiles.iter().any(|q| q.pubkey == p.pubkey) {
-                    profiles.push(p);
-                }
-            }
-        }
+        active.profiles.warm(missing);
         profiles
     }
 
@@ -7994,7 +8029,7 @@ mod tests {
         // that off the real $HOME (the guard isolates it, lock held).
         let _env = crate::test_env::EnvGuard::new("poster");
         let core = Arc::new(Core::new());
-        let mut rx = core.fetch_poster("not a url".into(), 16, |_| Err(()));
+        let mut rx = core.fetch_poster("not a url".into(), 16, |_| Err(()), |_| Err(()));
         let verdict = std::thread::spawn(move || rx.blocking_recv())
             .join()
             .unwrap();

@@ -215,21 +215,30 @@ impl ProfileView {
                     .last_visible_end
                     .max(start + 3)
                     .min(urls.len().div_ceil(3));
-                for (_, poster, blurhash, _) in urls.iter().take(end * 3).skip(start * 3) {
+                for (url, poster, blurhash, _) in urls.iter().take(end * 3).skip(start * 3) {
                     // A tile paints its poster when there is one, else the
-                    // blurhash placeholder (the same ladder the feed paints).
-                    // The VIDEO url is never pinned: the tile never paints
-                    // it as an image, and pinning it would pin whole files.
+                    // sniffed first frame (queued here; a real frame beats
+                    // an impression), else the blurhash filler (the same
+                    // ladder the feed paints). The VIDEO url itself is
+                    // never pinned: the tile never paints it as an image,
+                    // and pinning it would pin whole files.
                     if let Some(p) = poster {
                         media::fetch(&self.core, p.clone(), viewer, cx);
                         if !p.is_empty() && !painted.contains(p) {
                             painted.push(p.clone());
                         }
-                    } else if let Some(h) = blurhash {
-                        let key = crate::poster::blurhash_key(h);
+                    } else {
+                        let key = crate::poster::poster_key(url);
                         media::fetch(&self.core, key.clone(), viewer, cx);
                         if !painted.contains(&key) {
                             painted.push(key);
+                        }
+                        if let Some(h) = blurhash {
+                            let key = crate::poster::blurhash_key(h);
+                            media::fetch(&self.core, key.clone(), viewer, cx);
+                            if !painted.contains(&key) {
+                                painted.push(key);
+                            }
                         }
                     }
                 }
@@ -1175,16 +1184,17 @@ fn thumb_tile(
             f
         }
     };
-    // The preview ladder (D32): the publisher's poster, then a blurhash
-    // gradient, then a locally sniffed first frame — the picture a video
-    // tile paints is whichever the cache holds.
+    // The preview ladder (D32, reordered D72): the publisher's poster, then
+    // a locally sniffed first frame — a real frame beats an impression —
+    // then the blurhash gradient as the local filler. The picture a video
+    // tile paints is whichever the cache holds, best first.
     let shown = if !thumb.is_empty() {
         snap.png(thumb)
     } else {
         None
     }
-    .or_else(|| blurhash.and_then(|b| snap.png(&crate::poster::blurhash_key(b))))
-    .or_else(|| video_url.and_then(|u| snap.png(&crate::poster::poster_key(u))));
+    .or_else(|| video_url.and_then(|u| snap.png(&crate::poster::poster_key(u))))
+    .or_else(|| blurhash.and_then(|b| snap.png(&crate::poster::blurhash_key(b))));
     match shown {
         Some(png) => frame
             .child(

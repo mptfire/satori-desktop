@@ -22,7 +22,7 @@ use satori_core::manager::Profile;
 use satori_core::nip::{article, fields, imeta};
 
 use super::nav::Nav;
-use crate::{media, theme};
+use crate::{icons, media, theme};
 
 /// Timeline column width. Deliberately 640 — the webapp's was 720
 /// (styles.css:100 `#app { max-width: 720px }`); at 12–14px desktop type,
@@ -131,6 +131,20 @@ fn is_image_url(url: &str) -> bool {
     )
 }
 
+/// NIP-B7 blossom shape: the blob's sha256 IS the path's last segment (64
+/// hex chars). The extension-less byte-sniff fallback exists for THESE —
+/// a blob server serves raw bytes at an extension-less address. An
+/// extension-less WEB PAGE (a wiki slug, an /app/idNNN store path) is a
+/// page: it renders as a link row and carries an og: card — claiming it
+/// as a picture used to swallow the link into a tile that could never
+/// decode and suppress the card with it.
+fn is_blob_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    path.rsplit('/')
+        .next()
+        .is_some_and(|last| last.len() == 64 && last.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Video by extension — never fetched until asked; rendered as a play-card
 /// (inline player since Phase 3 — video.rs).
 pub(crate) fn is_video_url(url: &str) -> bool {
@@ -154,7 +168,7 @@ fn is_audio_url(url: &str) -> bool {
 /// tile), a video (poster tile; Phase 3 — inline click-to-play, the imeta
 /// mime tells an extension-less blossom URL from a picture), or an audio
 /// clip (NIP-A0 voice row: waveform + duration from imeta, playbin).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum MediaAsset {
     Picture {
         url: String,
@@ -283,7 +297,7 @@ fn media_assets_with(parsed: Option<&article::ArticleData>, ev: &Event) -> Vec<M
                     duration: None,
                     waveform: None,
                 }
-            } else if is_image_url(&url) || path_ext(&url).is_none() {
+            } else if is_image_url(&url) || is_blob_url(&url) {
                 MediaAsset::Picture { url: url.clone() }
             } else {
                 continue;
@@ -297,14 +311,48 @@ fn media_assets_with(parsed: Option<&article::ArticleData>, ev: &Event) -> Vec<M
 }
 
 /// Every url worth fetching for this event: the pictures plus, per video,
-/// the first preview source that applies — the publisher's poster, else a
-/// blurhash decode (virtual key, no network), else a first-frame sniff
-/// (virtual key; the video FILE is never fetched, only a capped head).
-/// Strict Tor keeps the sniff off entirely (the facade rule): the tile
-/// stays bare. A cache may still hold a sniff from before the switch —
-/// painting already-fetched bytes breaks no new ground.
+/// the preview sources that apply — the publisher's poster, else the
+/// first-frame sniff (virtual key; the video FILE is never fetched, only a
+/// capped head, then a ranged fetch through the proxy if the head can't
+/// decode) AND the blurhash decode (virtual key, no network — the local
+/// filler while the sniff runs, or forever when it fails). Strict Tor
+/// keeps the sniff off entirely (the facade rule): the tile stays bare,
+/// blurhash is its only placeholder. A cache may still hold a sniff from
+/// before the switch — painting already-fetched bytes breaks no new
+/// ground.
 pub fn media_urls(ev: &Event) -> Vec<String> {
     media_urls_from(&media_assets(ev), ev)
+}
+
+/// The note's first link worth a PREVIEW CARD (D73): an http(s) URL that
+/// isn't already a media tile (imeta pictures/videos, YouTube links —
+/// those render tiles with their own thumbnails; a YouTube page fetch is
+/// a Google contact the facade never makes), with tracking params
+/// stripped (the stripped form is the cache key AND the click target, so
+/// one link is one preview however many utm variants circulate). First
+/// link only, the owner's call: one card per note keeps the feed calm.
+fn og_candidate(ev: &Event, skip: &[String]) -> Option<String> {
+    for para in ev.content.split('\n') {
+        for token in para.split_whitespace() {
+            let (core, _) = split_trailing(token);
+            if !(core.starts_with("https://") || core.starts_with("http://")) {
+                continue;
+            }
+            if skip.iter().any(|m| m == core) || youtube_thumb(core).is_some() {
+                continue;
+            }
+            // A direct media file has no og: metadata to offer — the fetch
+            // would land NotMedia every time (the byte-sniff classifies
+            // these as tiles when they're standalone).
+            if is_image_url(core) || is_video_url(core) || is_audio_url(core) {
+                continue;
+            }
+            if web_url(core) {
+                return Some(satori_core::media::strip_tracking_params(core));
+            }
+        }
+    }
+    None
 }
 
 /// The url projection of ALREADY-PARSED assets (the poster/blurhash/sniff
@@ -324,19 +372,23 @@ fn media_urls_from(assets: &[MediaAsset], ev: &Event) -> Vec<String> {
                 mime,
             } => match poster {
                 Some(p) => vec![p.clone()],
-                None => match blurhash {
-                    Some(h) => vec![crate::poster::blurhash_key(h)],
-                    None => {
-                        // inline_able already refuses the facade (strict
-                        // Tor) and YouTube pages (the sniffer would fetch
-                        // a web page for nothing) — no sniff for either.
-                        if !crate::video::inline_able(url, mime.as_deref()) {
-                            vec![]
-                        } else {
-                            vec![crate::poster::poster_key(url)]
-                        }
+                None => {
+                    // The sniff is the real preview (a frame beats an
+                    // impression); the blurhash is the local filler that
+                    // paints while the sniff runs or when it fails — both
+                    // keys queue, the paint ladder picks the best held.
+                    let mut keys = Vec::new();
+                    // inline_able refuses the facade (strict Tor) and
+                    // YouTube pages (the sniffer would fetch a web page
+                    // for nothing) — no sniff for either.
+                    if crate::video::inline_able(url, mime.as_deref()) {
+                        keys.push(crate::poster::poster_key(url));
                     }
-                },
+                    if let Some(h) = blurhash {
+                        keys.push(crate::poster::blurhash_key(h));
+                    }
+                    keys
+                }
             },
         })
         .collect();
@@ -372,12 +424,43 @@ pub fn media_urls_cached(ev: &Event) -> std::sync::Arc<[String]> {
     if let Some(hit) = memo.map.get(&key) {
         return hit.clone();
     }
-    let urls: std::sync::Arc<[String]> = media_urls(ev).into();
+    let urls: std::sync::Arc<[String]> = {
+        let mut urls: Vec<String> = media_urls(ev);
+        // The link-preview card's fetch rides the same sweep (D73): the
+        // og: namespace delegates to og.rs inside media::fetch. Strict Tor
+        // never sees the key (the memo is mode-keyed), the facade holds.
+        if !strict && let Some(link) = body_parse_cached(ev).og_link.clone() {
+            urls.push(format!("og:{link}"));
+        }
+        urls.into()
+    };
     let memo = &mut *memo;
     fifo_trim(&mut memo.map, &mut memo.order, CAP);
     memo.order.push_back(key.clone());
     memo.map.insert(key, urls.clone());
     urls
+}
+
+/// The og: preview images ALREADY LANDED for this event's link. The og
+/// fetch hands the image URL to the media cache once, at landing — a URL
+/// no sweep knew about, so once RAM eviction dropped the bytes NOTHING
+/// ever asked again: the card's thumbnail went dark mid-session (the
+/// disappearing-image class the owner keeps hitting; the og card paints
+/// `preview.image` directly). Every view's visible sweep appends this,
+/// which both re-fetches an evicted image (disk cache hit, near instant)
+/// and — via the same list — pins it while the row is on screen. Not
+/// memoized on purpose: the verdict arrives asynchronously; the parse
+/// memo's frozen answer would strand late landings.
+pub(crate) fn og_image_urls(ev: &Event) -> Vec<String> {
+    let mut out = Vec::new();
+    for link in body_parse_cached(ev).og_link.iter() {
+        if let Some(preview) = crate::og::get(link)
+            && let Some(img) = &preview.image
+        {
+            out.push(img.clone());
+        }
+    }
+    out
 }
 
 /// The thumbnail for a YouTube link (watch?v=, youtu.be/, shorts/) —
@@ -491,6 +574,11 @@ pub(crate) enum Tok {
 /// Punctuation that commonly hugs a token ("(see nostr:nevent1…).") — split
 /// off so the link stays clean and the punctuation stays text.
 pub(crate) fn split_trailing(token: &str) -> (&str, &str) {
+    // A quote can never appear inside a URL (RFC 3986): content that
+    // embeds serialized-event JSON produces tokens like
+    // `https://x/","created_at":…` where the real link ends at the first
+    // quote — the trailer renders as plain text after the link.
+    let token = token.split('"').next().unwrap_or(token);
     let core = token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '”']);
     (&token[..core.len()], &token[core.len()..])
 }
@@ -816,6 +904,12 @@ fn body_parse_cached(ev: &Event) -> std::sync::Arc<BodyParse> {
         .iter()
         .filter_map(|m| m.alt.clone().map(|a| (m.url.clone(), a)))
         .collect();
+    let og_link = og_candidate(ev, &media_links);
+    if og_link.is_some() {
+        // One line per note that carries a card candidate: the D73 probe
+        // path — a note rendering without its card names itself here.
+        eprintln!("[og] link {} {og_link:?}", &ev.id.to_string()[..8]);
+    }
     let parsed = std::sync::Arc::new(BodyParse {
         cover,
         dims,
@@ -823,6 +917,7 @@ fn body_parse_cached(ev: &Event) -> std::sync::Arc<BodyParse> {
         murls: media_urls_from(&assets, ev).into(),
         assets,
         media_links,
+        og_link,
         article: parsed_article,
         emoji: std::sync::Arc::new(emoji_map(ev)),
     });
@@ -854,6 +949,9 @@ pub(crate) struct BodyParse {
     murls: std::sync::Arc<[String]>,
     assets: Vec<MediaAsset>,
     media_links: Vec<String>,
+    /// The note's first non-media http(s) link (D73): the link-preview
+    /// card's URL, None for notes with none (or media-only links).
+    pub(crate) og_link: Option<String>,
     article: Option<std::sync::Arc<article::ArticleData>>,
     /// The NIP-30 emoji map, computed on the memo's miss path and shared
     /// by every Body built from this parse (the audit's per-frame
@@ -877,7 +975,11 @@ pub fn article_data_cached(ev: &Event) -> Option<std::sync::Arc<article::Article
 /// reaction's emoji, or a stroke icon), avatar, name, optional verb (the
 /// caller styles it; zap sats ride in here emphasized), and the time,
 /// which is the third mode toggle (timefmt.rs) everywhere. The name opens
-/// the actor's profile when `open_profile` is given.
+/// the actor's profile when `open_profile` is given. `copy_id` (the
+/// note's NIP-21 URI) hangs the copy-the-id seal after the timestamp —
+/// None where the header announces an action on some other note
+/// (notification rows): the seal copies the note on screen, not the
+/// announcement.
 #[allow(clippy::too_many_arguments)]
 pub fn actor_header<V: EventEmitter<Nav> + 'static>(
     glyph: Option<AnyElement>,
@@ -888,6 +990,7 @@ pub fn actor_header<V: EventEmitter<Nav> + 'static>(
     time: String,
     id_prefix: String,
     open_profile: Option<PublicKey>,
+    copy_id: Option<String>,
     handle: Entity<V>,
 ) -> Div {
     // The name always carries an id (the click lives on it only when the
@@ -921,6 +1024,66 @@ pub fn actor_header<V: EventEmitter<Nav> + 'static>(
         None => head = head.child(name_el.flex_1()),
     }
     head.child(time_toggle(format!("{id_prefix}-time"), time))
+        .children(copy_id.map(|payload| copy_seal(&id_prefix, payload)))
+}
+
+/// The header copy seal's flash: which payload was just copied and when.
+/// A plain static (item closures have no cx to read an entity), keyed by
+/// the payload — two different notes never share one. The repaint rides
+/// timefmt::Signal, which every timestamp-bearing view already observes
+/// for the mode cycle: one wake shows the check, the expiry wake turns
+/// it back. profile.rs's flash_copy acknowledgment, generalized.
+static COPIED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn copied_now(payload: &str) -> bool {
+    COPIED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(p, _)| p == payload)
+}
+
+/// Copy `payload` (the note's NIP-21 URI) and flash the seal's glyph to a
+/// check for [`COPY_FLASH`].
+fn copy_id(payload: String, cx: &mut gpui::App) {
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload.clone()));
+    *COPIED.lock().unwrap() = Some((payload.clone(), std::time::Instant::now()));
+    cx.set_global(crate::timefmt::Signal);
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(COPY_FLASH).await;
+        if let Ok(mut held) = COPIED.lock()
+            && held.as_ref().is_some_and(|(p, _)| *p == payload)
+        {
+            *held = None;
+        }
+        // Wake the flash off even if a newer copy replaced it (that seal
+        // re-rendered anyway; the wake is one cheap repaint).
+        cx.update(|cx| cx.set_global(crate::timefmt::Signal));
+    })
+    .detach();
+}
+
+/// The seal after the timestamp: a quiet copy glyph that writes the
+/// note's NIP-21 URI (`nostr:nevent1…` / `nostr:naddr1…` — nip19.rs)
+/// and flashes a check while the flash lasts.
+pub(crate) fn copy_seal(id_prefix: &str, payload: String) -> impl IntoElement {
+    let flashed = copied_now(&payload);
+    div()
+        .id(SharedString::from(format!("{id_prefix}-copy")))
+        .cursor_pointer()
+        .text_color(rgb(theme::muted()))
+        .hover(|s| s.text_color(rgb(theme::ink())))
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            copy_id(payload.clone(), cx);
+        })
+        .child(if flashed {
+            icons::check_icon(theme::muted()).into_any_element()
+        } else {
+            icons::copy_icon(theme::muted()).into_any_element()
+        })
 }
 
 /// The timestamp tap target (timefmt.rs's third mode toggle: relative →
@@ -1103,6 +1266,15 @@ pub fn body_with<V: EventEmitter<Nav> + 'static>(
         body = body.child(section);
     }
 
+    // The link-preview card (D73): the note's first non-media link, when
+    // its og: preview has landed. Fetch rides the sweep; nothing paints
+    // until then (the link row above already names the destination).
+    if let Some(link) = &parsed.og_link
+        && let Some(preview) = crate::og::get(link)
+    {
+        body = body.child(og_card(link, &preview, ctx));
+    }
+
     // Quote embeds — compact previews, click opens the thread (embed_card).
     for bech in note_refs(ev) {
         match ctx.quotes.get(&bech) {
@@ -1152,6 +1324,88 @@ pub(crate) fn link_row(url: &str) -> AnyElement {
         })
         .child(display_url(url))
         .into_any_element()
+}
+
+/// The link-preview card (D73): the page's og: metadata as a bordered row
+/// under the note body — thumbnail left (when the page offers one and it
+/// has landed in the ordinary image cache), site + title + description
+/// right. Everything on it is attacker-written, so the sizes are capped at
+/// the source (core) and the layout clamps what it shows. The whole card
+/// is the click target: it opens what the link row above names (the M2
+/// web_url gate). The strip happened at extraction: the card's target
+/// carries no tracking params.
+fn og_card(
+    link: &str,
+    preview: &std::sync::Arc<satori_core::media::LinkPreview>,
+    ctx: &Body,
+) -> AnyElement {
+    let target = link.to_string();
+    let openable = web_url(&target);
+    let image = preview.image.as_deref().and_then(|img| ctx.media.png(img));
+    let card = div()
+        .id(seg_id("og", link))
+        .cursor_pointer()
+        .w_full()
+        .flex()
+        .gap_2()
+        .overflow_hidden()
+        .rounded(px(theme::R_EMBED))
+        .border_1()
+        .border_color(rgb(theme::hairline()))
+        .bg(rgb(theme::panel()))
+        .hover(|s| s.border_color(rgb(theme::vermilion())))
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            if openable {
+                cx.open_url(&target);
+            }
+        });
+    // The thumbnail: a fixed 96px column, cover-fitted; without a landed
+    // image the text column takes the whole card (the image pops in via
+    // the image fetch's own notify).
+    let card = if let Some(png) = image {
+        card.child(
+            div()
+                .w(px(96.0))
+                .h(px(72.0))
+                .flex_none()
+                .overflow_hidden()
+                .child(img(png).size_full().object_fit(ObjectFit::Cover)),
+        )
+    } else {
+        card
+    };
+    let mut text = div().w_full().flex().flex_col().gap_0p5().py_1().pr_2();
+    if !preview.site.is_empty() {
+        text = text.child(
+            div()
+                .text_size(px(theme::T_SMALL))
+                .text_color(rgb(theme::muted()))
+                .text_ellipsis()
+                .overflow_hidden()
+                .child(preview.site.to_uppercase()),
+        );
+    }
+    text = text.child(
+        div()
+            .text_size(px(theme::T_UI))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(theme::ink()))
+            .text_ellipsis()
+            .overflow_hidden()
+            .child(preview.title.clone()),
+    );
+    if let Some(desc) = &preview.description {
+        text = text.child(
+            div()
+                .text_size(px(theme::T_SMALL))
+                .text_color(rgb(theme::muted()))
+                .line_clamp(2)
+                .overflow_hidden()
+                .child(desc.clone()),
+        );
+    }
+    card.child(text).into_any_element()
 }
 
 /// Video tile: a poster frame wearing a play mark when the cache has one
@@ -1309,15 +1563,17 @@ fn video_tile(
             cx.stop_propagation();
             crate::video::open(url_for_open.clone(), mime_for_open.clone(), cx);
         });
-    // The preview ladder (D32): the publisher's poster (now OUR uploads
-    // embed one — D38's grab at attach time), a blurhash gradient, a
-    // locally sniffed first frame — any hit paints under the centered play
-    // mark; none means the quiet 16:9 panel, mark only (the filename row
-    // is gone — nobody read it).
+    // The preview ladder (D32, reordered D72): the publisher's poster (now
+    // OUR uploads embed one — D38's grab at attach time), then a locally
+    // sniffed first frame — a real frame beats an impression — and the
+    // blurhash gradient LAST: the local filler that paints while the sniff
+    // runs or when it fails. Any hit paints under the centered play mark;
+    // none means the quiet 16:9 panel, mark only (the filename row is gone
+    // — nobody read it).
     let shown = poster
         .and_then(|p| ctx.media.png(p))
-        .or_else(|| blurhash.and_then(|b| ctx.media.png(&crate::poster::blurhash_key(b))))
-        .or_else(|| ctx.media.png(&crate::poster::poster_key(url)));
+        .or_else(|| ctx.media.png(&crate::poster::poster_key(url)))
+        .or_else(|| blurhash.and_then(|b| ctx.media.png(&crate::poster::blurhash_key(b))));
     match shown {
         Some(png) => frame
             .child(
@@ -2041,9 +2297,20 @@ pub(crate) fn compact_card<V: EventEmitter<Nav> + 'static>(
                         .child(name),
                 )
                 .child(
-                    // The timestamp is the third mode toggle (timefmt.rs):
-                    // tap cycles relative → date → block height.
-                    time_toggle(SharedString::from(format!("{tag}-time-{idx}")), time),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(copy_seal(
+                            &format!("{tag}-{idx}"),
+                            satori_core::nip::nip19::uri(ev),
+                        ))
+                        // The timestamp is the third mode toggle (timefmt.rs):
+                        // tap cycles relative → date → block height.
+                        .child(time_toggle(
+                            SharedString::from(format!("{tag}-time-{idx}")),
+                            time,
+                        )),
                 ),
         )
         .child(
@@ -2224,5 +2491,160 @@ mod tests {
             emoji_map(&ev).get("sox").map(String::as_str),
             Some("https://a/sox.png")
         );
+    }
+}
+
+#[cfg(test)]
+mod og_tests {
+    use super::*;
+
+    fn ev_with(content: &str) -> Event {
+        let keys = Keys::generate();
+        let unsigned = UnsignedEvent::new(
+            keys.public_key(),
+            Timestamp::from_secs(1),
+            Kind::TextNote,
+            [],
+            content,
+        );
+        keys.sign_event(unsigned).unwrap()
+    }
+
+    #[test]
+    fn candidate_is_first_plain_link_stripped() {
+        let ev = ev_with("look at https://ex.com/p?utm_source=x&id=9 and prose");
+        assert_eq!(
+            og_candidate(&ev, &[]).as_deref(),
+            Some("https://ex.com/p?id=9")
+        );
+
+        // First link wins; later links never shadow it.
+        let ev = ev_with("https://a.ex/one https://b.ex/two");
+        assert_eq!(og_candidate(&ev, &[]).as_deref(), Some("https://a.ex/one"));
+    }
+
+    #[test]
+    fn candidate_skips_media_links_and_youtube() {
+        // An imeta picture URL is a tile already — not a card.
+        let ev = ev_with("https://img.ex/pic.jpg");
+        assert_eq!(og_candidate(&ev, &["https://img.ex/pic.jpg".into()]), None);
+
+        // YouTube links: the deterministic thumbnail tile covers them; a
+        // page fetch is a Google contact the facade never makes.
+        let ev = ev_with("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(og_candidate(&ev, &[]), None);
+    }
+
+    #[test]
+    fn candidate_skips_non_web_urls() {
+        // web_url gate: anything beyond http(s) never becomes a card
+        // (the M2 allow-list).
+        assert_eq!(
+            og_candidate(&ev_with("file:///etc/passwd"), &[]),
+            None,
+            "non-http(s) is not even a candidate"
+        );
+    }
+
+    /// The owner's failing note (nevent 501aac5f…): prose line, then the
+    /// URL alone on the next line.
+    #[test]
+    fn candidate_littles_law_note() {
+        let ev = ev_with(
+            "I'm going to apply Little's Law to ephemeral storage. \nhttps://en.wikipedia.org/wiki/Little%27s_law",
+        );
+        assert_eq!(
+            og_candidate(&ev, &[]).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Little%27s_law")
+        );
+    }
+
+    /// Content that embeds serialized-event JSON: the URL token carries
+    /// mid-token garbage (`","m`, `","created_at":…`). A quote is illegal
+    /// in a URL, so the candidate ends at the first one — and an imeta
+    /// picture inside that JSON now matches the media-link skip instead
+    /// of becoming a broken card.
+    #[test]
+    fn candidate_cuts_json_embedded_tokens() {
+        let (core, punct) = split_trailing("https://blossom.primal.net/3fbe956e.jpg\",\"m");
+        assert_eq!(core, "https://blossom.primal.net/3fbe956e.jpg");
+        assert_eq!(punct, "");
+        assert_eq!(
+            split_trailing("https://kuroshio.monster/\",\"created_at\":1794723232").0,
+            "https://kuroshio.monster/"
+        );
+        assert_eq!(
+            split_trailing("https://ex.com/a?utm_source=x\"}").0,
+            "https://ex.com/a?utm_source=x"
+        );
+    }
+
+    /// End to end: a JSON-embedded note (broken client) whose picture URL
+    /// now matches the media-link skip after the cut, with a real link
+    /// after it still winning the card.
+    #[test]
+    fn candidate_json_embedded_note_skips_media_finds_link() {
+        let ev = ev_with(
+            "{\"imeta\":[\"url https://blossom.primal.net/3fbe956e.jpg\",\"m image/jpeg\"]} https://real.example/page",
+        );
+        let media = vec!["https://blossom.primal.net/3fbe956e.jpg".to_string()];
+        assert_eq!(
+            og_candidate(&ev, &media).as_deref(),
+            Some("https://real.example/page")
+        );
+    }
+
+    /// The owner's reported note (92fa6a05…): an App Store link alone on
+    /// its last line. Extension-less paths (`/app/centimeters/id6832626453`)
+    /// are WEB PAGES, not blob bytes — they must never be claimed as
+    /// picture tiles (which suppressed the card).
+    #[test]
+    fn candidate_app_store_link_is_not_a_picture() {
+        let ev = ev_with("scan your room\n\nhttps://apps.apple.com/app/centimeters/id6832626453");
+        let assets = media_assets(&ev);
+        assert!(
+            assets.is_empty(),
+            "an app-store page is not a media tile: {assets:?}"
+        );
+        assert_eq!(
+            og_candidate(&ev, &[]).as_deref(),
+            Some("https://apps.apple.com/app/centimeters/id6832626453")
+        );
+    }
+
+    /// Same shape: a wiki slug (Little%27s_law) is a page, not bytes.
+    #[test]
+    fn candidate_wiki_slug_is_not_a_picture() {
+        let ev = ev_with("https://en.wikipedia.org/wiki/Little%27s_law");
+        assert!(media_assets(&ev).is_empty());
+        assert_eq!(
+            og_candidate(&ev, &[]).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Little%27s_law")
+        );
+    }
+
+    /// The blossom shape still rides the byte-sniff fallback: a 64-hex
+    /// path segment IS a blob address.
+    #[test]
+    fn blossom_blob_url_still_classifies_as_picture() {
+        let ev = ev_with(
+            "https://logen.btcforplebs.com/584dbd0e64cf17d19e4838c10ec22482495e61b52705029a263b8f85168f9048",
+        );
+        let assets = media_assets(&ev);
+        assert!(matches!(assets[0], MediaAsset::Picture { .. }));
+        // And a blob never becomes an og candidate: the real path hands
+        // the candidate pass the media links it came from, and it's in
+        // there (the skip list is what protects it).
+        let media: Vec<String> = assets.iter().map(|a| a.url().to_string()).collect();
+        assert_eq!(og_candidate(&ev, &media), None);
+    }
+
+    /// Direct media files inline in prose: no og card is possible (no
+    /// HTML, no metadata) — the candidate pass refuses them instead of
+    /// burning a NotMedia round trip.
+    #[test]
+    fn candidate_skips_direct_media_extensions() {
+        let ev = ev_with("look https://ex.com/photo.png and https://ex.com/clip.mp4");
+        assert_eq!(og_candidate(&ev, &[]), None);
     }
 }

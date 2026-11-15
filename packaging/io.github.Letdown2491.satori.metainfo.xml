@@ -29,6 +29,13 @@
   <launchable type="desktop-id">io.github.Letdown2491.satori.desktop</launchable>
   <url type="homepage">https://github.com/Letdown2491/satori-desktop</url>
   <releases>
+    <release version="0.9.0" date="2026-11-15">
+      <description>
+        <p>Video tiles earned their picture: a note's video previews its first frame instead of a bare box, big files and moov-at-end mp4s ride a guarded range-proxy, and GIF-encoded-as-mp4 clips play inline. Every note timestamp gained a copy button that puts a nostr: URI on the clipboard.</p>
+        <p>Notes with a plain link show a preview card: the page's og: metadata (site, title, description, thumbnail), fetched when the note scrolls into view, capped and parsed defensively, with the thumbnail riding the ordinary image cache; strict Tor keeps previews off entirely. Links are cleaned up too: the well-known tracking parameters (fbclid, gclid, the utm_* family) are stripped before display, before click-through, and before any preview fetch, so clicks don't carry their tags.</p>
+        <p>Clicking the new-notes chip is fast: the notes the live feed already saved paint immediately while the chip reads "Loading new notes…", and in multicolumn view the chip appears on the notes timeline only. Page landings no longer wait on a metadata round trip, the trust-graph's list fetch fires once per launch, and preview cards appear for extension-less web pages (a wiki slug, an App Store link used to render as a broken picture tile that suppressed its own card). The disappearing-image class closed its remaining roots: preview thumbnails, notifications-column images, and wire rows come back when memory pressure drops them.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-11-14">
       <description>
         <p>The interoperability pass continues on two fronts: what a note can ask for, and where a publish goes. Zaps learned arithmetic: NIP-57 splits pay every receiver with relative weights, a receiver with no lightning pointer fails alone instead of failing the split, and NIP-75 goals render as cards with live progress and a raised-of target line. Comments on articles, pictures, videos and wikis whisper "on {name}'s note" in the notifications pane and open the parent by its coordinate (NIP-22). The feed grew surfaces for the kinds it already carried: content warnings veil until revealed (NIP-36), emoji shortcodes render their images (NIP-30), subject lines headline the row (NIP-14/24), and an unknown kind with an alt tag describes itself (NIP-31).</p>

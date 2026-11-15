@@ -42,6 +42,16 @@ pub(crate) enum FeedMode {
 /// 512 tracked parents is far past one sitting's scrolling.
 const PARENTS_CAP: usize = 512;
 
+/// Dry rounds before the end-cap seal is believed: the relays genuinely
+/// remember nothing older (five straight pages deepened nothing). Impl
+/// level, not maybe_older-local — the seal-reopen chain condition (the
+/// audit's duplication lens) reads it too, and a literal `5` there
+/// drifted from this cap the moment it was inlined.
+const DRY_CAP: usize = 5;
+/// Cool-off between dry retries: the reader at the end cap fires
+/// wheel ticks, not pages — each dry round costs a relay trip.
+const DRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// The comment-count maps' bound — same discipline as PARENTS_CAP.
 const COUNTS_CAP: usize = 512;
 impl FeedMode {
@@ -85,7 +95,13 @@ pub struct Feed {
     counts_order: VecDeque<String>,
     /// Push signals since the last load (the live subscription): the
     /// new-notes pill's count. Nothing moves until the reader clicks.
+    /// The new-notes pill's count (Live::Post bumps), zeroed by a click.
     live_new: usize,
+    /// The pill's click promise: between the click and the first Loaded —
+    /// which since the paint-first refresh is the STORE page, near
+    /// instant — the chip reads "Loading new notes…" instead of a count
+    /// that was just zeroed.
+    loading_new: bool,
     /// The optimistic engagement mirrors (engagement.rs): the action row's
     /// glyph state, seeded from core's persisted sets, mutated optimistically.
     engagement: engagement::Engagement,
@@ -107,6 +123,13 @@ pub struct Feed {
     /// Endless scroll: the relays may have more; a round trip is in flight.
     has_more: bool,
     paging: bool,
+    /// Consecutive dry rounds (pages that came back with no more): the
+    /// seal is the LAST round's verdict, not the timeline's — a slow relay
+    /// round (the wot graph mid-load, a cold pool) used to seal the reader
+    /// out of history that exists. The seal reopens on continued scroll
+    /// until DRY_CAP rounds come back dry in a row.
+    dry_rounds: usize,
+    last_dry: Option<std::time::Instant>,
     /// The paging anchor: the oldest note timestamp EVER absorbed — not the
     /// window's last row. The RAM window (trim_window) drops the tail, and
     /// `older()` must continue from where the STREAM ended, not where the
@@ -209,6 +232,7 @@ impl Feed {
             counts_asked: HashSet::new(),
             counts_order: VecDeque::new(),
             live_new: 0,
+            loading_new: false,
             quotes: HashMap::new(),
             poll_tallies: HashMap::new(),
             poll_sel: HashMap::new(),
@@ -220,6 +244,8 @@ impl Feed {
             error: None,
             has_more: true,
             paging: false,
+            dry_rounds: 0,
+            last_dry: None,
             oldest_ts: None,
             snap: None,
             snap_dirty: true,
@@ -284,12 +310,18 @@ impl Feed {
                                 // Author feeds likewise: the pill would sit
                                 // under the profile's own header, noise. The
                                 // Library's bookmarks (D38) too: a follow's
-                                // post is not a new bookmark.
+                                // post is not a new bookmark. And ARTICLES:
+                                // in multicolumn view the reader watches both
+                                // timelines; a follow's fresh long-form lit
+                                // both pills — the notes timeline is where
+                                // "new" is announced (the articles column
+                                // catches up on its own refresh).
                                 if matches!(
                                     feed.mode,
                                     FeedMode::Hashtag(_)
                                         | FeedMode::Profile(_)
                                         | FeedMode::Bookmarks
+                                        | FeedMode::Articles
                                 ) {
                                     return;
                                 }
@@ -404,7 +436,7 @@ impl Feed {
     /// reader at the end cap.
     fn maybe_older(&mut self, visible_end: usize, cx: &mut Context<Self>) {
         const LOOKAHEAD: usize = 12;
-        if !self.has_more || self.paging || self.notes.is_empty() {
+        if self.paging || self.notes.is_empty() {
             return;
         }
         // The bookmark list is finite (D38) — the one-shot load never pages.
@@ -414,6 +446,18 @@ impl Feed {
         }
         if visible_end + LOOKAHEAD < self.notes.len() {
             return;
+        }
+        if !self.has_more {
+            // A dry seal reopens on the reader's continued scroll: the
+            // failed round may have raced the wot graph's load or a cold
+            // relay pool, and every retry deepens the store even when it
+            // lands nothing. DRY_CAP straight dry rounds is the real end.
+            if self.dry_rounds >= DRY_CAP {
+                return;
+            }
+            if self.last_dry.is_some_and(|t| t.elapsed() < DRY_COOLDOWN) {
+                return;
+            }
         }
         self.paging = true;
         // The anchor, not the window's last row: the RAM window may have
@@ -515,11 +559,21 @@ impl Feed {
                 self.want_counts(cx);
                 self.status.clear();
                 self.error = None;
+                // The badge click's promise is kept: the notes are in place.
+                self.loading_new = false;
                 // The bookmark list is finite (D38) — never page it.
                 self.has_more = !matches!(self.mode, FeedMode::Bookmarks);
+                self.dry_rounds = 0;
             }
             FeedEvent::Older(page, more) => {
-                self.has_more = more;
+                if more {
+                    self.has_more = true;
+                    self.dry_rounds = 0;
+                } else {
+                    self.has_more = false;
+                    self.dry_rounds += 1;
+                    self.last_dry = Some(std::time::Instant::now());
+                }
                 self.paging = false;
                 let old = self.notes.len();
                 self.absorb(page.notes, page.profiles, cx);
@@ -539,8 +593,10 @@ impl Feed {
                 // order the next page now instead of waiting for a tick
                 // that may never come. Pages served from the store are
                 // near-instant, so a dry-spell relay trip deepens the store
-                // once and the chain runs free afterwards.
-                if self.has_more {
+                // once and the chain runs free afterwards. A dry round
+                // chains too (the cool-off in maybe_older spaces the
+                // retries): a slow relay round must not park the reader.
+                if self.has_more || self.dry_rounds < DRY_CAP {
                     self.maybe_older(self.last_visible_end, cx);
                 }
             }
@@ -592,6 +648,8 @@ impl Feed {
                 self.error = Some(states::PaneError::transient("The feed", &e));
                 // A failed round trip must not wedge the end cap.
                 self.paging = false;
+                // ...nor the pill's loading state.
+                self.loading_new = false;
             }
             _ => {}
         }
@@ -814,9 +872,18 @@ impl Feed {
 
     /// Queue core fetches for every media URL we haven't got yet. Results
     /// land in the shared media cache (media.rs) — a `cx.notify()` re-render
-    /// picks them up via the snapshot.
+    /// picks them up via the snapshot. The og: keys are NOT queued here:
+    /// this sweep runs at note ARRIVAL (absorb) — previewing every link a
+    /// relay pushes at us before the reader ever scrolls to it turned the
+    /// facade rule's worst case up (third-party contacts keyed to what
+    /// relays send, not what the user sees). The visible list factory
+    /// requests the og: key when the row actually renders — the same
+    /// discipline every avatar and picture rides (audit system-usage #1).
     fn want_images(&mut self, note: &Event, cx: &mut Context<Self>) {
         for url in content::media_urls_cached(note).iter().cloned() {
+            if url.starts_with("og:") {
+                continue;
+            }
             media::fetch(&self.core, url, cx.entity_id(), cx);
         }
     }
@@ -1188,6 +1255,7 @@ fn note_card(
             time,
             format!("note-{idx}"),
             Some(ev.pubkey),
+            Some(satori_core::nip::nip19::uri(&ev)),
             handle.clone(),
         ))
         // The reply context (nip10.ts replyContext, option B): the parent's
@@ -1352,13 +1420,22 @@ impl Render for Feed {
                             .on_click(move |_, _, cx| {
                                 handle.update(cx, |feed, cx| {
                                     feed.live_new = 0;
+                                    // The chip keeps its promise visibly:
+                                    // "Loading new notes…" until the first
+                                    // Loaded — the paint-first refresh makes
+                                    // that the store page, near instant.
+                                    feed.loading_new = true;
                                     feed.scroll_top();
                                     let rx = feed.core.refresh(feed.mode.kinds());
                                     feed.pump(rx, cx);
                                     cx.notify();
                                 });
                             })
-                            .child(new_notes_label(n)),
+                            .child(if self.loading_new {
+                                "Loading new notes…".to_string()
+                            } else {
+                                new_notes_label(n)
+                            }),
                     ),
                 )
             })
@@ -1480,6 +1557,9 @@ fn card_media_urls(ev: &Event, profiles: &HashMap<String, Profile>) -> Vec<Strin
             urls.push(p.picture.clone());
         }
         urls.extend(content::media_urls_cached(note).iter().cloned());
+        // The landed og:image rides the sweep: the card paints it, so an
+        // eviction must come back (and pin) like every other picture.
+        urls.extend(content::og_image_urls(note));
     }
     let mut urls: Vec<String> = Vec::new();
     if u16::from(ev.kind) == 6 {
@@ -1569,6 +1649,9 @@ fn repost_card(
                     time,
                     format!("boost-{}", ev.id),
                     None,
+                    // The seal copies the boosted note (the note on screen),
+                    // not the kind-6 envelope.
+                    Some(satori_core::nip::nip19::uri(&note)),
                     handle.clone(),
                 ))
                 .child(
@@ -1761,7 +1844,49 @@ fn trim_target(len: usize, visible_end: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_target;
+    use super::*;
+    use crate::og;
+    use satori_core::media::LinkPreview;
+
+    fn ev_with(content: &str) -> Event {
+        use nostr::prelude::*;
+        let keys = Keys::generate();
+        let unsigned = UnsignedEvent::new(
+            keys.public_key(),
+            Timestamp::from_secs(1),
+            Kind::TextNote,
+            [],
+            content.to_string(),
+        );
+        keys.sign_event(unsigned).unwrap()
+    }
+
+    /// The disappearing-image regression (owner, Nov 2026): the og card
+    /// paints `preview.image`, a URL NO view's re-request sweep knew — so
+    /// once the RAM cache evicted the bytes, nothing ever asked again and
+    /// the card's thumbnail went dark for the session. The invariant: a
+    /// landed preview's image rides the same sweep every other painted
+    /// picture rides (card_media_urls feeds both the feed's item-closure
+    /// re-request and pin_window's pin set).
+    #[test]
+    fn landed_og_image_rides_the_sweep_set() {
+        let ev = ev_with("read this\n\nhttps://ex.example/page");
+        let image = "https://img.example/thumb.png";
+        og::seed_test_preview(
+            "https://ex.example/page",
+            LinkPreview {
+                site: "ex.example".into(),
+                title: "A page".into(),
+                description: None,
+                image: Some(image.to_string()),
+            },
+        );
+        let urls = card_media_urls(&ev, &HashMap::new());
+        assert!(
+            urls.iter().any(|u| u == image),
+            "the landed og:image must ride the visible sweep: {urls:?}"
+        );
+    }
 
     #[test]
     fn window_stays_while_under_the_ceiling() {

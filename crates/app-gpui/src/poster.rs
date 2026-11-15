@@ -35,10 +35,13 @@ pub const MAX_IN_FLIGHT: usize = 2;
 /// Counted from job start (head download included) to landing.
 pub static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// The head-download cap: ~2s of 1080p or the whole moov + first frames
-/// of most web-encoded mp4s. A file that needs more than this to show a
-/// frame (moov at the end) fails the sniff and stays a bare tile.
-pub const POSTER_HEAD_BYTES: usize = 2 * 1024 * 1024;
+/// The head-download cap: the opener frames of most web-encoded faststart
+/// mp4s. Trimmed from 2MB when the ranged sniff (D72's `sniff_uri`) took
+/// over the files that need more — a faststart file whose opener isn't in
+/// the first MB now falls through to ranged fetching instead of blind
+/// over-fetching here. A file that needs more than this to show a frame
+/// (moov at the end) fails this sniff and falls through.
+pub const POSTER_HEAD_BYTES: usize = 1024 * 1024;
 
 /// Sniffed frames encode down to this width: previews paint at ≤560px,
 /// and a 1080p frame counts 8MB against the media cache's decoded-byte
@@ -130,20 +133,59 @@ pub fn sniff_png(head: &[u8]) -> Result<(u32, u32, Vec<u8>), ()> {
         .map_err(|_| ())?;
     f.write_all(head).map_err(|_| ())?;
     drop(f);
-    let out = sniff_file(&tmp);
+    let src = || {
+        gstreamer::ElementFactory::make("filesrc")
+            .property("location", tmp.to_string_lossy().to_string())
+            .build()
+            .map_err(|_| ())
+    };
+    let out = sniff_source(src, std::time::Duration::from_secs(10));
     let _ = std::fs::remove_file(&tmp);
     out
 }
 
-fn sniff_file(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), ()> {
+/// The ranged sniff (D72's fourth rung): the same decode against a URI —
+/// the caller hands the ORIGIN url and this door it through the
+/// RangeProxy (M5 WP3: no pipeline sees an origin URL; every fetch rides
+/// the pinned media client). GStreamer's source speaks Range, so a
+/// moov-at-end file — undecodable from any head — still previews: the
+/// demuxer ranges to the tail itself. The pipeline dies after the first
+/// frame, so the fetch is the moov plus a couple of frames, not the file.
+/// Blocking, bounded; same workshop slot and cache slot as the head sniff.
+pub fn sniff_uri(origin: &str) -> Result<(u32, u32, Vec<u8>), ()> {
+    let proxy = satori_core::video_proxy::spawn(origin.to_string()).map_err(|_| ())?;
+    let uri = proxy.uri();
+    let src = move || {
+        use gstreamer::prelude::*;
+        // Build first, THEN set "uri": the factory builder validates
+        // .property against the FACTORY's gobject props (no "uri" there —
+        // it panics before the element ever exists).
+        let src = gstreamer::ElementFactory::make("souphttpsrc")
+            .build()
+            .map_err(|_| ())?;
+        // "location", not "uri": gst 1.26 (the freedesktop runtime) dropped
+        // the "uri" alias; "location" is the property on every version.
+        src.set_property("location", uri.clone());
+        Ok(src)
+    };
+    // Ranged demuxing walks more round trips than the head sniff (the
+    // moov can sit at the tail) — a wider deadline, same shape.
+    let out = sniff_source(src, std::time::Duration::from_secs(15));
+    drop(proxy);
+    out
+}
+
+/// The shared sniff: decode `src`'s FIRST usable frame (skipping a black
+/// opener — many encoders start one) and encode it to PNG.
+fn sniff_source(
+    src: impl FnOnce() -> Result<gstreamer::Element, ()>,
+    deadline_budget: std::time::Duration,
+) -> Result<(u32, u32, Vec<u8>), ()> {
     use gstreamer::prelude::*;
 
     gstreamer::init().map_err(|_| ())?;
     let pipeline = gstreamer::Pipeline::new();
-    let src = gstreamer::ElementFactory::make("filesrc")
-        .property("location", path.to_string_lossy().to_string())
-        .build()
-        .map_err(|_| ())?;
+    let src = src().map_err(|_| ())?;
     let dec = gstreamer::ElementFactory::make("decodebin")
         .build()
         .map_err(|_| ())?;
@@ -183,9 +225,9 @@ fn sniff_file(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), ()> {
     // The deadline bounds the whole sniff: a server that trickles, a file
     // whose moov lives at the end (nothing decodable from head bytes), a
     // audio-only stream — all die here and the tile stays bare.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + deadline_budget;
     // Preroll hands the opener frame; many encoders start a black one.
-    let Some(sample) = pull_until(&sink, deadline) else {
+    let Some(sample) = pull_until(&pipeline, &sink, deadline) else {
         let _ = pipeline.set_state(gstreamer::State::Null);
         return Err(());
     };
@@ -207,6 +249,7 @@ fn sniff_file(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), ()> {
         )
         .is_ok()
         && let Some(sample) = pull_until(
+            &pipeline,
             &sink,
             deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(4)),
         )
@@ -220,14 +263,26 @@ fn sniff_file(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), ()> {
     encode_png(&first.2, first.0, first.1)
 }
 
-/// One sample before `deadline`, else None (a cheap poll: preroll and
-/// post-seek buffers both arrive as ordinary appsink pushes).
+/// One sample before `deadline`, else None (a cheap poll). While the
+/// pipeline is paused the opener frame sits in the PREROLL slot —
+/// `try_pull_sample` never sees it (the vendored player's worker knows
+/// this: pull_preroll until Playing). Probe-verified D72: a Paused
+/// pipeline with a prerolled frame returns None from try_pull_sample
+/// for 15s straight.
 fn pull_until(
+    pipeline: &gstreamer::Pipeline,
     sink: &gstreamer_app::AppSink,
     deadline: std::time::Instant,
 ) -> Option<gstreamer::Sample> {
+    use gstreamer::prelude::*;
     while std::time::Instant::now() < deadline {
-        if let Some(s) = sink.try_pull_sample(Some(gstreamer::ClockTime::from_mseconds(250))) {
+        let playing = pipeline.state(gstreamer::ClockTime::ZERO).1 == gstreamer::State::Playing;
+        let sample = if playing {
+            sink.try_pull_sample(Some(gstreamer::ClockTime::from_mseconds(250)))
+        } else {
+            sink.try_pull_preroll(Some(gstreamer::ClockTime::from_mseconds(250)))
+        };
+        if let Some(s) = sample {
             return Some(s);
         }
     }

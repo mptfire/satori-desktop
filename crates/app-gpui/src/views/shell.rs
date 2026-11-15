@@ -1715,6 +1715,30 @@ impl Shell {
             .when(!self.columns_on, |d| {
                 d.child(self.columns_toggle_button(cx))
             })
+            // The add-column button, above Settings (owner's move: in
+            // columns mode the workspace's + slot sat after the last
+            // column, so adding one meant scrolling the row first). Only
+            // while the workspace owns the view and the cap allows; the
+            // menu it opens is the same add_menu card.
+            .when(
+                self.workspace_up() && self.columns.len() < COLUMN_CAP,
+                |d| {
+                    d.child(self.rail_button(
+                        "rail-add-column",
+                        "Add column",
+                        icons::plus_icon(if self.add_menu {
+                            theme::vermilion()
+                        } else {
+                            theme::ink()
+                        }),
+                        self.add_menu,
+                        cx.listener(move |shell, _, _, cx| {
+                            shell.add_menu = !shell.add_menu;
+                            cx.notify();
+                        }),
+                    ))
+                },
+            )
             // Compose speaks (it broadcasts) — the pen wears vermilion.
             .child(self.rail_button(
                 "rail-settings",
@@ -2325,46 +2349,6 @@ impl Shell {
                     ),
             );
         }
-        // The + slot: the add-column menu's anchor, only while a kind is
-        // unpinned (the cap and the kind list are the same size).
-        if self.columns.len() < COLUMN_CAP {
-            row = row.child(
-                div()
-                    .flex_none()
-                    .w(px(44.0))
-                    .h_full()
-                    .flex()
-                    .items_start()
-                    .justify_center()
-                    .pt(px(16.0))
-                    .child(
-                        div()
-                            .id("col-add")
-                            .cursor_pointer()
-                            .size(px(32.0))
-                            .rounded(px(theme::R_EMBED))
-                            .border_1()
-                            // The ring tints with the text: ink at rest
-                            // (muted was invisible on washi — user report),
-                            // vermilion on hover.
-                            .border_color(rgb(theme::muted()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(theme::T_UI))
-                            .text_color(rgb(theme::ink()))
-                            .hover(|s| {
-                                s.border_color(rgb(theme::vermilion()))
-                                    .text_color(rgb(theme::vermilion()))
-                            })
-                            .on_click(cx.listener(|shell, _, _, cx| {
-                                shell.add_menu = !shell.add_menu;
-                                cx.notify();
-                            }))
-                            .child("+"),
-                    ),
-            );
-        }
         div()
             .relative()
             .flex_1()
@@ -2399,8 +2383,11 @@ impl Shell {
         let pinned: Vec<ColumnKind> = self.columns.iter().map(|c| c.kind.clone()).collect();
         let mut card = div()
             .absolute()
+            // Anchored to the rail now: the + lives in the sidebar (the
+            // workspace row's slot is gone), so the card opens beside it
+            // — top of the workspace, just clear of the 52px rail.
             .top(px(52.0))
-            .right(px(24.0))
+            .left(px(12.0))
             .w(px(220.0))
             .rounded(px(theme::R_EMBED))
             .border_1()

@@ -26,7 +26,9 @@ Satori is a daily-driver desktop client, in active development.
 - Timeline: endless scrolling through your history. Media, quotes,
   reposts (NIP-18), polls (NIP-88, vote and compose), long-form articles
   (NIP-23), hashtag timelines; a pill counts new notes that arrive
-  while you read and loads them on click
+  while you read and loads them on click; link preview cards (the
+  page's og: metadata) with tracking parameters stripped from every
+  link in every note
 - Threads: NIP-10 reply trees, NIP-22 comments (on articles too, with
   reply affordance and counts), reply-to-root routing
 - Composer: tabs for note, picture (NIP-68), video (NIP-71 kind 22),

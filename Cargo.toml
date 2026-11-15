@@ -28,9 +28,17 @@ members = ["crates/core", "crates/app-gpui"]
 # matcher already prefers the CBDT face; gpui's gate was the blocker.
 [patch.crates-io]
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+# D72 (Nov 2026): gpui-video-player 0.1.3 rejects caps framerate 0/1 —
+# exactly what GIF-to-MP4 converters emit (nostr.build, 21media) — so
+# every gif-as-mp4 tap died at Video::new and degraded to the browser
+# ("pipeline failed ... Framerate(0.0)"). The value only feeds the
+# framerate() getter (frames are appsink-pulled, not paced off it), so
+# the vendored copy keeps the file and drops the zero-fps arm. Upstream
+# 0.1.3 is newest as of Nov 2026; retire the patch if a release fixes it.
+gpui-video-player = { path = "vendor/gpui-video-player" }
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 authors = ["Letdown2491"]

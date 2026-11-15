@@ -516,6 +516,13 @@ pub fn fetch(core: &Arc<Core>, url: String, view: EntityId, cx: &mut gpui::App) 
     if url.is_empty() {
         return;
     }
+    // The og: namespace is the link-preview store's (og.rs), not the image
+    // cache's: it carries text + an image reference, and lands with its
+    // own notify. Delegated before any image-cache bookkeeping.
+    if let Some(page) = url.strip_prefix("og:") {
+        crate::og::fetch(core, page.to_string(), view, cx);
+        return;
+    }
     // The key kinds: real media URLs, and the two virtual namespaces the
     // poster ladder synthesizes (D32) — a blurhash decode (no network)
     // and a sniffed poster frame (capped head download + local decode).
@@ -666,6 +673,7 @@ pub fn fetch(core: &Arc<Core>, url: String, view: EntityId, cx: &mut gpui::App) 
                                     video,
                                     crate::poster::POSTER_HEAD_BYTES,
                                     crate::poster::sniff_png,
+                                    crate::poster::sniff_uri,
                                 );
                                 {
                                     let mut rx = rx;

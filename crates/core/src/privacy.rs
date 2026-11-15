@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrivacyMode {
@@ -36,4 +38,16 @@ impl PrivacyMode {
     pub fn fail_closed(self) -> bool {
         matches!(self, Self::Strict)
     }
+}
+
+/// The mode from prefs.json (`privacy_mode`, privacy.ts). Core-side reader:
+/// the preview fetch gate lives next to the fetch it guards — a future
+/// caller of `fetch_link_preview` cannot bypass the UI's check. M5 wires
+/// the full toggle; today only strict has a face in the UI.
+pub fn privacy_mode() -> PrivacyMode {
+    config::prefs()
+        .as_deref()
+        .and_then(|v| v.get("privacy_mode"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }

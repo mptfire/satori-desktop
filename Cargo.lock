@@ -2493,8 +2493,6 @@ checksum = "4b0d73e1bc02eef886a5947f41b8512708792e9e5d3053d181843311a487f96f"
 [[package]]
 name = "gpui-video-player"
 version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f201ad246dbbd1d30c69808e0a68af89401ac47a9b3e41f13c40510f3daf6fbe"
 dependencies = [
  "core-foundation 0.10.1",
  "core-video",
@@ -5305,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "satori-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "bech32",
@@ -5332,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "satori-gpui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blurhash",
  "chrono",

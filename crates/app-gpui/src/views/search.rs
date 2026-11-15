@@ -252,6 +252,14 @@ impl Render for SearchView {
         for p in self.profiles.values() {
             media::fetch(&self.core, p.picture.clone(), viewer, cx);
         }
+        // The og card's thumbnail paints preview.image — a URL the parse
+        // never knew (the disappearing-image class): re-request it with
+        // the avatars, every render, like the other bounded sweeps.
+        for ev in &self.results {
+            for url in content::og_image_urls(ev) {
+                media::fetch(&self.core, url, viewer, cx);
+            }
+        }
         let quotes = self.quotes.clone();
         let input = self.input.clone();
         // The Input reports percent height (it fills its parent), which

@@ -543,6 +543,12 @@ impl Render for ArticleView {
         for url in content::media_urls_cached(&self.ev).iter().cloned() {
             media::fetch(&self.core, url, cx.entity_id(), cx);
         }
+        // The og card's thumbnail paints preview.image — a URL the parse
+        // never knew; re-request it like any picture (long-read flash
+        // recovery below repins the same set).
+        for url in content::og_image_urls(&self.ev) {
+            media::fetch(&self.core, url, cx.entity_id(), cx);
+        }
         for block in blocks.iter() {
             if let markdown::Block::Image { url } = block {
                 media::fetch(&self.core, url.clone(), cx.entity_id(), cx);
@@ -793,12 +799,22 @@ impl Render for ArticleView {
                                                                 .child(name),
                                                         ),
                                                 )
-                                                .child(content::time_toggle(
-                                                    SharedString::from(format!(
-                                                        "comment-time-{ci}"
-                                                    )),
-                                                    time,
-                                                )),
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .child(content::copy_seal(
+                                                            &format!("comment-{ci}"),
+                                                            satori_core::nip::nip19::uri(&ev),
+                                                        ))
+                                                        .child(content::time_toggle(
+                                                            SharedString::from(format!(
+                                                                "comment-time-{ci}"
+                                                            )),
+                                                            time,
+                                                        )),
+                                                ),
                                         )
                                         .child(content::body(
                                             &ev,

@@ -1,0 +1,46 @@
+[package]
+name = "gpui-video-player"
+version = "0.1.3"
+edition = "2024"
+exclude = ["assets"]
+authors = ["nemurubaka <cijiugechu@gmail.com>"]
+description = "A video player library for gpui applications, built on top of GStreamer."
+homepage = "https://github.com/cijiugechu/gpui-video-player"
+repository = "https://github.com/cijiugechu/gpui-video-player"
+license = "MIT"
+readme = "README.md"
+keywords = ["gpui", "video", "player", "gstreamer"]
+categories = ["multimedia"]
+documentation = "https://docs.rs/gpui-video-player"
+
+[features]
+default = ["gpui"]
+gpui = ["dep:gpui", "dep:core-video"]
+gpui-pre = ["dep:gpui_pre", "dep:core-video-pre", "dep:objc2-core-foundation", "dep:objc2-core-video"]
+
+[dependencies]
+gpui = { version = "0.2", optional = true }
+gpui_pre = { package = "gpui-pre", version = "=0.3.9", default-features = false, optional = true }
+gstreamer = "0.25"
+gstreamer-app = "0.25" # appsink
+gstreamer-base = "0.25" # basesrc
+gstreamer-video = "0.25" # video info/frames (stride-aware copies)
+glib = "0.22" # gobject traits and error type
+log = "0.4"
+thiserror = "2"
+url = "2" # media uri
+parking_lot = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+smallvec = "1"
+yuv = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-video = { version = "0.4", optional = true }
+core-video-pre = { package = "core-video", version = "0.6", optional = true }
+core-foundation = "0.10"
+objc2-core-foundation = { version = "0.3.2", optional = true }
+objc2-core-video = { version = "0.3.2", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit"] }
