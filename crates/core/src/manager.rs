@@ -83,7 +83,8 @@ pub enum FeedEvent {
     /// Older page + has-more.
     Older(FeedPage, bool),
     Replies(Vec<Event>, Vec<Profile>),
-    /// Notifications (replies + mentions; reactions stay off by default).
+    /// Notifications (own-note replies; ancestor mentions omitted;
+    /// engagement reactions keep their existing preference).
     Notifications(Vec<Event>, Vec<Profile>),
     /// Whether the bell should light (unread past high-water).
     NotifDot(bool),
@@ -471,7 +472,8 @@ pub enum PostKind {
 /// NIP-78 login sync) that ride the same broadcast for want of a second one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Live {
-    /// A reply or mention tagging me (#p) — light the bell.
+    /// A reply on your own note (#e) or a profile zap (#p) lights the
+    /// bell. Ancestor-only mentions remain ordinary live state.
     Mention,
     /// A fresh post from a follow — bump the timeline's new-notes pill.
     Post,
@@ -3428,18 +3430,18 @@ impl Core {
                     .unwrap_or(0)
                     .saturating_sub(7 * 86400);
 
-                // Mentions (#p=me) and replies (#e=my notes): PARALLEL.
-                // (The pref was already read for the cached phase — no
-                // second disk read here.)
-                let mut mention_kinds =
-                    vec![Kind::TextNote, Kind::Custom(1111), Kind::Custom(9735)];
+                // Own-note replies are already covered by the #e query
+                // below, alongside explicit quotes/reposts and votes.
+                // This auxiliary query only carries profile engagements.
+                // Never collect all plain #p text mentions from threads.
+                let mut engagement_kinds = vec![Kind::Custom(9735)];
                 if reaction_notifs {
-                    mention_kinds.push(Kind::Reaction);
+                    engagement_kinds.push(Kind::Reaction);
                 }
-                let mention_q = Box::pin(
+                let engagement_q = Box::pin(
                     active.pool.get(
                         Filter::new()
-                            .kinds(mention_kinds)
+                            .kinds(engagement_kinds)
                             .pubkeys([me])
                             .since(Timestamp::from(since))
                             .limit(200),
@@ -3509,7 +3511,7 @@ impl Core {
                     ))
                 };
                 let (mentions_res, replies_res, votes_res, reposts_res, quotes_res) = tokio::join!(
-                    mention_q,
+                    engagement_q,
                     async {
                         match reply_q {
                             Some(q) => q.await.unwrap_or_default(),
@@ -6759,16 +6761,20 @@ impl Core {
         let my_epoch = live_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let me = active.me();
         let follows = active.follows.clone();
+        // Only query the user's own note references for a thread reply
+        // signal. Inherited ancestor p tags aren't own-note evidence.
+        let own_note_ids: HashSet<EventId> = active
+            .pool
+            .store
+            .feed_page(&[me], None, 500)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
         self.rt.spawn(async move {
             let now = Timestamp::now();
-            // NIP-01: an empty list can never match — the follows-scoped
-            // filters join only when there are follows to scope by.
-            let mut filters = vec![
-                Filter::new()
-                    .kinds([Kind::TextNote, Kind::Custom(1111), Kind::Custom(9735)])
-                    .pubkey(me)
-                    .since(now),
-            ];
+            let mut filters = live_direct_notification_filters(me, &own_note_ids, now);
             if !follows.is_empty() {
                 filters.push(
                     Filter::new()
@@ -6888,7 +6894,9 @@ impl Core {
                 if crate::dedup::observe(&event, relay_url.as_str()) {
                     continue;
                 }
-                let sig = if event.tags.clone().public_keys().any(|pk| pk == me) {
+                let sig = if should_ring_direct_notification(event.kind, event.pubkey, me) {
+                    // The admitted query is either `#e` to an own note or
+                    // a profile-directed zap. Own events aren't alerts.
                     Some(Live::Mention)
                 } else {
                     Some(Live::Post)
@@ -7088,6 +7096,34 @@ impl Core {
         let held = self.active.lock().unwrap().clone();
         held.ok_or(LoginError::Resume("no active session".into()))
     }
+}
+
+fn should_ring_direct_notification(kind: Kind, author: PublicKey, me: PublicKey) -> bool {
+    author != me && matches!(u16::from(kind), 1 | 1111 | 9735)
+}
+
+fn live_direct_notification_filters(
+    me: PublicKey,
+    own_note_ids: &HashSet<EventId>,
+    since: Timestamp,
+) -> Vec<Filter> {
+    // Thread mentions are broad ancestor-carried p tags, not an
+    // owned-note reply. Profile zaps retain #p as their own case.
+    let mut filters = vec![
+        Filter::new()
+            .kind(Kind::Custom(9735))
+            .pubkey(me)
+            .since(since),
+    ];
+    if !own_note_ids.is_empty() {
+        filters.push(
+            Filter::new()
+                .kinds([Kind::TextNote, Kind::Custom(1111)])
+                .events(own_note_ids.iter().copied())
+                .since(since),
+        );
+    }
+    filters
 }
 
 fn now_secs() -> u64 {
@@ -7679,6 +7715,69 @@ impl Core {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn direct_note_live_filters_prefer_owned_event_ids_over_thread_mentions() {
+        let me = Keys::generate().public_key();
+        let mine = EventId::from_byte_array([1u8; 32]);
+        let ids = std::collections::HashSet::from([mine]);
+        let filters = live_direct_notification_filters(me, &ids, Timestamp::from(123));
+        let fields = |wanted: u16| {
+            serde_json::to_value(&filters)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["kinds"].as_array().unwrap().contains(&wanted.into()))
+                .unwrap()
+                .clone()
+        };
+        let replies = fields(1);
+        assert_eq!(replies["#e"], serde_json::json!([mine.to_string()]));
+        assert!(replies.get("#p").is_none());
+        assert_eq!(fields(1111)["#e"], serde_json::json!([mine.to_string()]));
+        assert_eq!(fields(9735)["#p"], serde_json::json!([me.to_string()]));
+        assert!(fields(9735).get("#e").is_none());
+    }
+
+    #[test]
+    fn direct_note_live_filters_allow_zaps_without_own_note_ids() {
+        let filters = live_direct_notification_filters(
+            Keys::generate().public_key(),
+            &std::collections::HashSet::new(),
+            Timestamp::from(123),
+        );
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&filters).unwrap()[0]["kinds"],
+            serde_json::json!([9735])
+        );
+    }
+
+    #[test]
+    fn direct_note_live_signals_never_include_own_events() {
+        let me = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        assert!(!should_ring_direct_notification(Kind::TextNote, me, me));
+        assert!(!should_ring_direct_notification(Kind::Custom(1111), me, me));
+        assert!(!should_ring_direct_notification(Kind::Custom(9735), me, me));
+        assert!(should_ring_direct_notification(Kind::TextNote, other, me));
+        assert!(should_ring_direct_notification(
+            Kind::Custom(1111),
+            other,
+            me
+        ));
+        assert!(should_ring_direct_notification(
+            Kind::Custom(9735),
+            other,
+            me
+        ));
+        assert!(!should_ring_direct_notification(
+            Kind::ContactList,
+            other,
+            me
+        ));
+    }
 
     /// The synced draft round-trip (D38 v1.4): attachment imetas survive
     /// the serde pass verbatim, and a legacy entry (no attachments key)
